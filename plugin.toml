@@ -1,0 +1,8 @@
+schema = 1
+id = "sidebar2"
+name = "Sidebar Kanban"
+version = "0.2.0"
+description = "Fixed Kanban sidebar (TODO / Processing / DONE) managing Host + Session, Tabs, and Panes."
+icon = "kanban"
+window = "window.luau"
+styles = ["sidebar.css"]
