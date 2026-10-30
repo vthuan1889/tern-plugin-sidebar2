@@ -1101,7 +1101,7 @@ local function build_view(data: CollectedData): (Node, Node)
 			root_children,
 			ui.node("col", {
 				key = "group_" .. g.id,
-				role = "sidebar2.group",
+				role = "sidebar2.group." .. g.id,
 			}, group_children)
 		)
 	end
