@@ -918,7 +918,29 @@ local node_ctx: { [string]: NodeCtx } = {}
 
 local function reg_node(key: string, ctx: NodeCtx)
 	node_ctx[key] = ctx
-	node_ctx["main." .. key] = ctx
+end
+
+local function resolve_node_ctx(node_id: string?): NodeCtx?
+	if not node_id or node_id == "" then
+		return nil
+	end
+	if node_ctx[node_id] then
+		return node_ctx[node_id]
+	end
+	local leaf = string.match(node_id, "([^.]+)$")
+	if leaf and node_ctx[leaf] then
+		return node_ctx[leaf]
+	end
+	local best_ctx: NodeCtx? = nil
+	local best_len = 0
+	for k, ctx in pairs(node_ctx) do
+		local klen = #k
+		if klen > best_len and string.sub(node_id, -(klen + 1)) == "." .. k then
+			best_len = klen
+			best_ctx = ctx
+		end
+	end
+	return best_ctx
 end
 
 type DomLevel2 = {
@@ -1221,7 +1243,7 @@ local function build_view(data: CollectedData): (Node, Node)
 							reg_node("fold_t_" .. tkey, tctx)
 							reg_node("drop_t_" .. tkey, tctx)
 
-							local l2_menu: { string } = { "Focus Tab" }
+							local l2_menu: { string } = { "Focus Tab", "New Tab" }
 							if can_reorder_tabs then
 								table.insert(l2_menu, "Pick Tab")
 								if tab.pos > 1 then
@@ -2050,7 +2072,7 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		return nil
 	end
 	local cmd, val = parse_action(ev)
-	local nctx = if ev.node then node_ctx[ev.node] else nil
+	local nctx = resolve_node_ctx(ev.node)
 
 	if cmd == "hide_sidebar" then
 		set_sidebar_visible(cx, false)
@@ -2320,13 +2342,16 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		return true
 	elseif cmd == "new_tab_in" or cmd == "New Tab" then
 		local sid = tonumber(val) or (if nctx then nctx.sess_id else nil)
-		if sid then
-			pcall(function()
-				cx.sessions:switch(sid)
-				cx.layout:new_tab(nil, { focus = true })
+		pcall(function()
+			local ok_cs, cur = pcall(function()
+				return cx.sessions:current()
 			end)
-			sync_and_render(cx, true)
-		end
+			if sid and (not ok_cs or not cur or cur.id ~= sid) then
+				cx.sessions:switch(sid)
+			end
+			cx.layout:new_tab(nil, { focus = true })
+		end)
+		sync_and_render(cx, true)
 		return true
 	elseif cmd == "rename_sess" or cmd == "Rename Session" then
 		local sid = tonumber(val) or (if nctx then nctx.sess_id else nil)
@@ -2357,7 +2382,7 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 					pcall(function()
 						prompt_cx.layout:name_tab(tid, if new_name ~= "" then new_name else nil)
 					end)
-					sync_and_render(cx, true)
+					sync_and_render(prompt_cx, true)
 				end
 			end)
 		end
@@ -2366,12 +2391,54 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		local tid = tonumber(val) or (if nctx then nctx.tab_id else nil)
 		if tid then
 			local owned = owned_canvases(cx)
+			-- If sidebar canvas is inside this tab, move it to a sibling tab first
+			local ok_t, tlist = pcall(function()
+				return cx.session:tabs()
+			end)
+			local target_sess = if nctx then nctx.sess_id else nil
+			local sibling_tid: number? = nil
+			if ok_t and type(tlist) == "table" then
+				for _, t in ipairs(tlist) do
+					if t.id == tid and not target_sess then
+						target_sess = t.session
+					end
+				end
+				for _, t in ipairs(tlist) do
+					if t.session == target_sess and t.id ~= tid then
+						sibling_tid = t.id
+						break
+					end
+				end
+			end
+			if sibling_tid then
+				for spane, _ in pairs(owned) do
+					if cx.session:tab_of(spane) == tid then
+						pcall(function()
+							cx.layout:move_to_tab(spane, sibling_tid, { focus = false })
+						end)
+					end
+				end
+			end
+			local to_close: { [number]: boolean } = {}
 			for _, pid in ipairs(tab_all_panes(cx, tid)) do
 				if not owned[pid] then
-					pcall(function()
-						cx.layout:close(pid)
-					end)
+					to_close[pid] = true
 				end
+			end
+			local ok_p, plist = pcall(function()
+				return cx.session:panes()
+			end)
+			if ok_p and type(plist) == "table" then
+				for _, p in ipairs(plist) do
+					if p.tab == tid and not owned[p.pane] then
+						to_close[p.pane] = true
+					end
+				end
+			end
+			for pid, _ in pairs(to_close) do
+				pcall(function()
+					cx.layout:close(pid)
+				end)
 			end
 			sync_and_render(cx, true)
 		end
