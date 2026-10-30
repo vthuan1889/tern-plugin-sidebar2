@@ -148,6 +148,18 @@
   font-weight: 600 !important;
 }
 
+/* Full-width clickable title areas inside Level 1 and Level 2 rows */
+.sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.l1_title"],
+.sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.l2_title"],
+[data-role="sidebar2.l1_title"],
+[data-role="sidebar2.l2_title"] {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  align-self: stretch !important;
+  padding: 2px 4px !important;
+  cursor: pointer;
+}
+
 /* Level 3: Pane Row */
 .sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.level3"],
 .sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.level3.current"],

@@ -906,30 +906,28 @@ local function build_view(data: CollectedData): (Node, Node)
 						justify = "between",
 						align = "center",
 					}, {
-						ui.row({
-							ui.node("badge", {
-								key = "pick_s_" .. sess.skey,
-								text = grip_icon,
-								tone = if is_picked then "warning" else "neutral",
-								actions = { click = "pick=" .. sess.skey, menu = l1_menu },
-							}),
-							ui.node("row", {
-								key = "title_s_" .. sess.skey,
-								role = "sidebar2.l1_title",
-								align = "center",
-								actions = {
-									click = "focus_sess=" .. tostring(sess.id),
-									menu = l1_menu,
-								},
-							}, {
-								ui.badge(sess.host_name, host_badge_tone),
-								ui.text({
-									ui.span(
-										short_text(sess.name, 20) .. sess_status,
-										if sess.current then "strong" else nil
-									),
-									ui.span(" " .. tostring(#sess.tabs) .. "t", "muted"),
-								}),
+						ui.node("badge", {
+							key = "pick_s_" .. sess.skey,
+							text = grip_icon,
+							tone = if is_picked then "warning" else "neutral",
+							actions = { click = "pick=" .. sess.skey, menu = l1_menu },
+						}),
+						ui.node("row", {
+							key = "title_s_" .. sess.skey,
+							role = "sidebar2.l1_title",
+							align = "center",
+							actions = {
+								click = "focus_sess=" .. tostring(sess.id),
+								menu = l1_menu,
+							},
+						}, {
+							ui.badge(sess.host_name, host_badge_tone),
+							ui.text({
+								ui.span(
+									short_text(sess.name, 20) .. sess_status,
+									if sess.current then "strong" else nil
+								),
+								ui.span(" " .. tostring(#sess.tabs) .. "t", "muted"),
 							}),
 						}),
 						ui.node("badge", {
@@ -971,10 +969,10 @@ local function build_view(data: CollectedData): (Node, Node)
 							table.insert(l2_menu, "rename_tab=" .. tkey)
 							table.insert(l2_menu, "close_tab=" .. tkey)
 
-							local left_children: { Node } = {}
+							local l2_children: { Node } = {}
 							if can_reorder_tabs then
 								table.insert(
-									left_children,
+									l2_children,
 									ui.node("badge", {
 										key = "pick_t_" .. tkey,
 										text = if is_tab_picked then "🎯" elseif is_tab_drop_target then "↕" else "⠿",
@@ -990,7 +988,7 @@ local function build_view(data: CollectedData): (Node, Node)
 								)
 							end
 							table.insert(
-								left_children,
+								l2_children,
 								ui.node("row", {
 									key = "title_t_" .. tkey,
 									role = "sidebar2.l2_title",
@@ -1010,28 +1008,27 @@ local function build_view(data: CollectedData): (Node, Node)
 								})
 							)
 
-							local right_child: Node? = nil
 							if is_tab_drop_target then
-								right_child = ui.node("badge", {
-									key = "drop_t_" .. tkey,
-									text = "↕ #" .. tostring(tab.pos),
-									tone = "info",
-									actions = { click = drop_tab_act },
-								})
+								table.insert(
+									l2_children,
+									ui.node("badge", {
+										key = "drop_t_" .. tkey,
+										text = "↕ #" .. tostring(tab.pos),
+										tone = "info",
+										actions = { click = drop_tab_act },
+									})
+								)
 							elseif has_sub then
-								right_child = ui.node("badge", {
-									key = "fold_t_" .. tkey,
-									text = t_chev,
-									tone = "neutral",
-									actions = { click = "fold_tab=" .. tkey, menu = l2_menu },
-								})
+								table.insert(
+									l2_children,
+									ui.node("badge", {
+										key = "fold_t_" .. tkey,
+										text = t_chev,
+										tone = "neutral",
+										actions = { click = "fold_tab=" .. tkey, menu = l2_menu },
+									})
+								)
 							end
-
-							local l2_children: { Node } = { ui.row(left_children) }
-							if right_child then
-								table.insert(l2_children, right_child)
-							end
-
 							local l2_row = ui.node("row", {
 								key = "l2_" .. tkey,
 								role = l2_role,
