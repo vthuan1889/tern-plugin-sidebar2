@@ -490,17 +490,22 @@ def worker_loop(kv_path: str):
             pos = get_stencil_client_pos()
             if pos is not None:
                 vx, vy, cw, _ch = pos
-                side = cached_snap.get("side") or "left"
-                in_band = (vx <= cw * 0.45) if side == "left" else (vx >= cw * 0.55)
-                if in_band:
-                    press_pos = (vx, vy)
-                    if cached_snap.get("valid"):
-                        drag_item = hit_test_start(cached_snap, vx, vy)
-                    if drag_item is None:
+                press_pos = (vx, vy)
+                if cached_snap.get("valid"):
+                    drag_item = hit_test_start(cached_snap, vx, vy)
+                if drag_item is None:
+                    bounds = cached_snap.get("bounds")
+                    in_band = (
+                        (bounds[0] - 60 <= vx <= bounds[2] + 60)
+                        if bounds
+                        else (vx <= cw * 0.65 or vx >= cw * 0.35)
+                    )
+                    if in_band:
                         snap = snapshot_geometry(kv_path)
                         if snap.get("valid"):
                             cached_snap = snap
                             drag_item = hit_test_start(cached_snap, vx, vy)
+                if drag_item is not None:
                     write_status(data_dir, {
                         "pid": int(my_pid),
                         "snap_valid": bool(cached_snap.get("valid")),

@@ -335,6 +335,19 @@
   overflow: visible !important;
   animation: none !important;
 }
+
+/* Context Menu Section Divider ("-" in actions.menu -> empty button.mi) */
+div.pop > button.mi:empty {
+  height: 1px !important;
+  min-height: 1px !important;
+  max-height: 1px !important;
+  padding: 0 !important;
+  margin: 4px 6px !important;
+  background: var(--l2, rgba(255, 255, 255, 0.14)) !important;
+  border: none !important;
+  border-radius: 0 !important;
+  pointer-events: none !important;
+}
 [data-role="sidebar2.level3"]:hover {
   background: color-mix(in srgb, var(--t1) 6%, transparent);
 }

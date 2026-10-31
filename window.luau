@@ -8,6 +8,8 @@ local ui = tern.ui
 
 local SIDEBAR_TITLE = "Kanban"
 local SIDEBAR_ABOUT = "Fixed Kanban sidebar (TODO / Processing / DONE) organizing Host + Session, Tabs, and Panes."
+-- Pinned width like Tern's Settings pane: only ⇄ (flip_side) changes side, nothing changes width.
+local FIXED_SIDEBAR_RATIO = 0.20
 
 type GroupId = "todo" | "doing" | "done"
 
@@ -63,7 +65,7 @@ local function load_state(): PersistedState
 		visible = tbl.auto_open
 	end
 	local side: "left" | "right" = if tbl.side == "right" then "right" else "left"
-	local ratio = 0.20
+	local ratio = FIXED_SIDEBAR_RATIO
 	local cols_est = if type(tbl.cols_est) == "number" then clamp(tbl.cols_est, 60, 600) else 180
 	return {
 		visible = visible,
@@ -86,6 +88,14 @@ local function save_state()
 	pcall(tern.kv.set, "state", persisted)
 end
 
+-- Overwrite the width an older build drifted to, so kv.json never carries a stale ratio again.
+pcall(function()
+	local ok_s, raw = pcall(tern.kv.get, "state")
+	if ok_s and type(raw) == "table" and raw.ratio ~= persisted.ratio then
+		save_state()
+	end
+end)
+
 -- Runtime state (per window VM)
 local busy_lock = false
 local picked_skey: string? = nil
@@ -106,6 +116,8 @@ local pane_notif: { [number]: "waiting" | "done" | "error" } = {}
 local prev_pane_busy: { [number]: boolean } = {}
 local known_agents: { [number]: boolean } = {}
 local ack_alerts: { [number]: boolean } = {}
+local closing_internally: { [number]: boolean } = {}
+local active_sidebar_pane: number? = nil
 
 do
 	local ok_dd, dd = pcall(tern.kv.get, "drag_drop")
@@ -142,6 +154,7 @@ local synced_tab_ratio: { [number]: number } = {}
 local last_user_pane_by_tab: { [number]: number } = {}
 local last_active_session_id: number? = nil
 local last_active_tab_id: number? = nil
+local last_active_tab_by_session: { [number]: number } = {}
 local current_stage_label = "TODO"
 local current_stage_tone = "info"
 
@@ -218,6 +231,7 @@ local function close_stale_canvases(cx: WindowCx, active_host_id: number?)
 						persisted.owned_panes[pkey] = nil
 						painted_fp[p.pane] = nil
 						opened_at_ms[p.pane] = nil
+						closing_internally[p.pane] = true
 						dirty = true
 						pcall(function()
 							cx.layout:close(p.pane)
@@ -298,6 +312,58 @@ local function first_user_pane(cx: WindowCx, tab_id: number, owned: { [number]: 
 		end
 	end
 	return nil
+end
+
+-- Nearest tab of the same session that still holds a user pane: previous tab, then next, then distance.
+local function find_best_sibling_tab(
+	cx: WindowCx,
+	sess_id: number?,
+	closing_tid: number,
+	owned: { [number]: boolean }
+): number?
+	if not sess_id then
+		return nil
+	end
+	local ok_t, tlist = pcall(function()
+		return cx.session:tabs()
+	end)
+	if not ok_t or type(tlist) ~= "table" then
+		return nil
+	end
+	local sess_tabs: { TabInfo } = {}
+	for _, t in ipairs(tlist) do
+		if t.session == sess_id then
+			table.insert(sess_tabs, t)
+		end
+	end
+	table.sort(sess_tabs, function(a, b)
+		if a.position ~= b.position then
+			return a.position < b.position
+		end
+		return a.id < b.id
+	end)
+	local closing_idx = 0
+	for idx, t in ipairs(sess_tabs) do
+		if t.id == closing_tid then
+			closing_idx = idx
+			break
+		end
+	end
+	if closing_idx == 0 then
+		return nil
+	end
+	local best: number? = nil
+	local best_score = math.huge
+	for idx, t in ipairs(sess_tabs) do
+		if t.id ~= closing_tid then
+			local score = math.abs(idx - closing_idx) * 2 + (if idx > closing_idx then 1 else 0)
+			if score < best_score and first_user_pane(cx, t.id, owned) ~= nil then
+				best = t.id
+				best_score = score
+			end
+		end
+	end
+	return best
 end
 
 -- ---------------------------------------------------------------------------
@@ -541,8 +607,23 @@ local function collect_data(cx: WindowCx): CollectedData
 			end
 		end
 		if not belongs then
-			local first_t = raw_tabs_by_sess[active_session_id][1]
-			active_tab_id = if first_t then first_t.id else nil
+			local remembered = last_active_tab_by_session[active_session_id]
+			if remembered then
+				for _, t in ipairs(raw_tabs_by_sess[active_session_id]) do
+					if t.id == remembered then
+						active_tab_id = remembered
+						belongs = true
+						break
+					end
+				end
+			end
+			if not belongs then
+				local first_t = raw_tabs_by_sess[active_session_id][1]
+				active_tab_id = if first_t then first_t.id else nil
+			end
+		end
+		if active_tab_id then
+			last_active_tab_by_session[active_session_id] = active_tab_id
 		end
 	end
 	-- 6. Managed sessions across all hosts
@@ -1016,12 +1097,6 @@ local function build_view(data: CollectedData): (Node, Node)
 				tone = "neutral",
 				actions = { click = "refresh" },
 			}),
-			ui.node("badge", {
-				key = "btn_hide",
-				text = "Hide ✕",
-				tone = "error",
-				actions = { click = "hide_sidebar" },
-			}),
 		}),
 	})
 	table.insert(root_children, toolbar)
@@ -1049,8 +1124,9 @@ local function build_view(data: CollectedData): (Node, Node)
 			actions = {
 				click = head_click,
 				menu = {
-					"Toggle Group",
 					"New Session",
+					"",
+					"Toggle Group",
 				},
 			},
 		}, {
@@ -1105,6 +1181,14 @@ local function build_view(data: CollectedData): (Node, Node)
 
 					local l1_menu: { string } = {
 						"Focus Session",
+						"Rename Session",
+						"",
+						"New Tab",
+						"",
+						"Move to TODO",
+						"Move to PROCESSING",
+						"Move to DONE",
+						"",
 						"Pick Session",
 					}
 					if can_reorder_sess then
@@ -1115,11 +1199,6 @@ local function build_view(data: CollectedData): (Node, Node)
 							table.insert(l1_menu, "Move Session Down")
 						end
 					end
-					table.insert(l1_menu, "Move to TODO")
-					table.insert(l1_menu, "Move to PROCESSING")
-					table.insert(l1_menu, "Move to DONE")
-					table.insert(l1_menu, "New Tab")
-					table.insert(l1_menu, "Rename Session")
 					table.insert(dom_level1, {
 						skey = sess.skey,
 						sess_id = sess.id,
@@ -1243,8 +1322,15 @@ local function build_view(data: CollectedData): (Node, Node)
 							reg_node("fold_t_" .. tkey, tctx)
 							reg_node("drop_t_" .. tkey, tctx)
 
-							local l2_menu: { string } = { "Focus Tab", "New Tab" }
+							local l2_menu: { string } = {
+								"Focus Tab",
+								"Rename Tab",
+								"",
+								"New Tab",
+								"Close Tab",
+							}
 							if can_reorder_tabs then
+								table.insert(l2_menu, "")
 								table.insert(l2_menu, "Pick Tab")
 								if tab.pos > 1 then
 									table.insert(l2_menu, "Move Tab Up")
@@ -1253,8 +1339,6 @@ local function build_view(data: CollectedData): (Node, Node)
 									table.insert(l2_menu, "Move Tab Down")
 								end
 							end
-							table.insert(l2_menu, "Rename Tab")
-							table.insert(l2_menu, "Close Tab")
 
 							local l2_children: { Node } = {}
 							if can_reorder_tabs then
@@ -1385,8 +1469,10 @@ local function build_view(data: CollectedData): (Node, Node)
 											click = focus_pane_act,
 											menu = {
 												"Focus Pane",
+												"",
 												"Split Right",
 												"Split Down",
+												"",
 												"Close Pane",
 											},
 										},
@@ -1434,31 +1520,11 @@ local function build_view(data: CollectedData): (Node, Node)
 		justify = "between",
 		align = "center",
 	}, {
-		ui.row({
-			ui.node("badge", {
-				key = "dock_new_sess",
-				text = "+ Session",
-				tone = "info",
-				actions = { click = "new_session" },
-			}),
-			ui.node("badge", {
-				key = "dock_new_tab",
-				text = "+ Tab",
-				tone = "neutral",
-				actions = { click = "new_tab" },
-			}),
-			ui.node("badge", {
-				key = "dock_move",
-				text = "Move…",
-				tone = "warning",
-				actions = { click = "move_modal" },
-			}),
-		}),
 		ui.node("badge", {
-			key = "dock_hide",
-			text = "Hide ✕",
-			tone = "neutral",
-			actions = { click = "hide_sidebar" },
+			key = "dock_new_sess",
+			text = "+ Session",
+			tone = "info",
+			actions = { click = "new_session" },
 		}),
 	})
 
@@ -1469,10 +1535,12 @@ end
 -- Fixed Sidebar Layout Engine (Per-Host Canvas + Ratio Sync + Refocus)
 -- ---------------------------------------------------------------------------
 local function close_all_sidebars(cx: WindowCx)
+	active_sidebar_pane = nil
 	local owned = owned_canvases(cx)
 	for spane, _ in pairs(owned) do
 		painted_fp[spane] = nil
 		persisted.owned_panes[tostring(spane)] = nil
+		closing_internally[spane] = true
 		pcall(function()
 			cx.layout:close(spane)
 		end)
@@ -1481,6 +1549,8 @@ local function close_all_sidebars(cx: WindowCx)
 	save_state()
 	table.clear(synced_tab_ratio)
 end
+
+local place_sidebar_at_edge: (WindowCx, number, number, "left" | "right", number) -> boolean
 
 local function cleanup_orphan_sidebar_tabs(cx: WindowCx, owned: { [number]: boolean }, active_session_id: number?)
 	if not active_session_id then
@@ -1498,46 +1568,56 @@ local function cleanup_orphan_sidebar_tabs(cx: WindowCx, owned: { [number]: bool
 			table.insert(sess_tabs, t)
 		end
 	end
+	table.sort(sess_tabs, function(a, b)
+		if a.position ~= b.position then
+			return a.position < b.position
+		end
+		return a.id < b.id
+	end)
 	if #sess_tabs <= 1 then
 		return
 	end
 
-	-- Find a tab in this session that has at least one user pane
-	local fallback_user_tab: number? = nil
-	local orphan_spane_tabs: { { tab_id: number, spane: number } } = {}
+	-- Sidebar-only tabs: move their canvas into the nearest sibling tab that still has a user pane
+	local orphans: { { tab_id: number, spanes: { number } } } = {}
 	for _, t in ipairs(sess_tabs) do
-		local all_p = tab_all_panes(cx, t.id)
 		local has_user = false
-		local spane_in_tab: number? = nil
-		for _, pid in ipairs(all_p) do
+		local spanes: { number } = {}
+		for _, pid in ipairs(tab_all_panes(cx, t.id)) do
 			if owned[pid] then
-				spane_in_tab = pid
+				table.insert(spanes, pid)
 			else
 				has_user = true
 			end
 		end
-		if has_user and not fallback_user_tab then
-			fallback_user_tab = t.id
-		elseif not has_user and spane_in_tab and #all_p == 1 then
-			table.insert(orphan_spane_tabs, { tab_id = t.id, spane = spane_in_tab })
+		if not has_user and #spanes > 0 then
+			table.insert(orphans, { tab_id = t.id, spanes = spanes })
 		end
 	end
 
-	if fallback_user_tab and #orphan_spane_tabs > 0 then
-		for _, item in ipairs(orphan_spane_tabs) do
-			local u = first_user_pane(cx, fallback_user_tab, owned)
-			if u then
-				pcall(function()
-					cx.layout:move_to_tab(item.spane, fallback_user_tab, { focus = false })
-				end)
-				pcall(function()
-					cx.layout:focus(u)
-				end)
+	for _, item in ipairs(orphans) do
+		local target_tab = find_best_sibling_tab(cx, active_session_id, item.tab_id, owned)
+		local u = if target_tab then first_user_pane(cx, target_tab, owned) else nil
+		synced_tab_ratio[item.tab_id] = nil
+		for idx, spane in ipairs(item.spanes) do
+			if u and target_tab and idx == 1 then
+				synced_tab_ratio[target_tab] = nil
+				place_sidebar_at_edge(cx, spane, target_tab, persisted.side, persisted.ratio)
 			else
+				closing_internally[spane] = true
+				persisted.owned_panes[tostring(spane)] = nil
+				painted_fp[spane] = nil
+				opened_at_ms[spane] = nil
 				pcall(function()
-					cx.layout:close(item.spane)
+					cx.layout:close(spane)
 				end)
 			end
+		end
+		if u and target_tab then
+			last_user_pane_by_tab[target_tab] = u
+			pcall(function()
+				cx.layout:focus(u)
+			end)
 		end
 	end
 end
@@ -1574,6 +1654,7 @@ local function find_host_sidebar(
 		painted_fp[ex] = nil
 		opened_at_ms[ex] = nil
 		persisted.owned_panes[tostring(ex)] = nil
+		closing_internally[ex] = true
 		pcall(function()
 			cx.layout:close(ex)
 		end)
@@ -1650,6 +1731,7 @@ local function match_ratio(cx: WindowCx, spane: number, tab_id: number, side: "l
 				local actual_delta = new_share - cur_share
 				if math.abs(actual_delta) > 0.005 then
 					persisted.cols_est = clamp(math.abs(cells / actual_delta), 60, 600)
+					save_state()
 				end
 				synced_tab_ratio[tab_id] = new_share
 				if math.abs(target_ratio - new_share) <= 0.012 then
@@ -1672,21 +1754,33 @@ local function edge_user_leaf(node: TabTree?, side: "left" | "right", spane: num
 	return edge_user_leaf(node[first_idx], side, spane) or edge_user_leaf(node[second_idx], side, spane)
 end
 
-local function place_sidebar_at_edge(
+local function is_pane_floating(lay: TabLayout?, spane: number): boolean
+	if not lay or type(lay.floats) ~= "table" then
+		return false
+	end
+	for _, f in ipairs(lay.floats) do
+		if f.pane == spane then
+			return true
+		end
+	end
+	return false
+end
+
+place_sidebar_at_edge = function(
 	cx: WindowCx,
 	spane: number,
 	tab_id: number,
 	side: "left" | "right",
 	target_ratio: number
-)
+): boolean
 	local cur_tab = cx.session:tab_of(spane)
 	local moved_tabs = false
 	if cur_tab ~= tab_id then
-		local ok_m = pcall(function()
-			cx.layout:move_to_tab(spane, tab_id, { focus = false })
+		local ok_m, moved_ok = pcall(function()
+			return cx.layout:move_to_tab(spane, tab_id, { focus = false })
 		end)
-		if not ok_m then
-			return
+		if not ok_m or moved_ok == false then
+			return false
 		end
 		moved_tabs = true
 		synced_tab_ratio[tab_id] = nil
@@ -1695,8 +1789,20 @@ local function place_sidebar_at_edge(
 	local ok_l, lay = pcall(function()
 		return cx.session:layout(tab_id)
 	end)
-	if not ok_l or not lay then
-		return
+	if not ok_l or not lay or lay.zoomed then
+		return moved_tabs
+	end
+
+	if is_pane_floating(lay, spane) then
+		pcall(function()
+			cx.layout:dock(spane, nil, side, { focus = false })
+		end)
+		ok_l, lay = pcall(function()
+			return cx.session:layout(tab_id)
+		end)
+		if not ok_l or not lay then
+			return moved_tabs
+		end
 	end
 
 	local at_edge, cur_share = is_sidebar_at_root_edge(lay, spane, side)
@@ -1706,19 +1812,45 @@ local function place_sidebar_at_edge(
 			pcall(function()
 				cx.layout:move(spane, target_leaf, side, { focus = false })
 			end)
+			ok_l, lay = pcall(function()
+				return cx.session:layout(tab_id)
+			end)
+			if lay then
+				at_edge, cur_share = is_sidebar_at_root_edge(lay, spane, side)
+			end
 		end
-		ok_l, lay = pcall(function()
-			return cx.session:layout(tab_id)
-		end)
-		at_edge, cur_share = is_sidebar_at_root_edge(lay, spane, side)
+		-- A root "down" split keeps the sidebar off the side edge: sink the other leaves under
+		-- target_leaf so the vertical split ends up inside the user subtree instead of the root.
+		if not at_edge and lay and lay.root and lay.root.split == "down" and target_leaf then
+			local tree_panes: { number } = {}
+			collect_tree_panes(lay.root, tree_panes)
+			for _, pid in ipairs(tree_panes) do
+				if pid ~= spane and pid ~= target_leaf then
+					pcall(function()
+						cx.layout:move(pid, target_leaf, "down", { focus = false })
+					end)
+				end
+			end
+			ok_l, lay = pcall(function()
+				return cx.session:layout(tab_id)
+			end)
+			if lay then
+				at_edge, cur_share = is_sidebar_at_root_edge(lay, spane, side)
+			end
+		end
 		synced_tab_ratio[tab_id] = nil
+		moved_tabs = true
 	end
 
-	if at_edge and cur_share then
-		if math.abs(cur_share - target_ratio) > 0.015 then
-			match_ratio(cx, spane, tab_id, side, target_ratio)
-		end
+	if not at_edge or not cur_share then
+		return moved_tabs
 	end
+	if math.abs(cur_share - target_ratio) > 0.015 then
+		match_ratio(cx, spane, tab_id, side, target_ratio)
+	else
+		synced_tab_ratio[tab_id] = cur_share
+	end
+	return moved_tabs
 end
 
 local function refocus_terminal(cx: WindowCx, tab_id: number?, owned: { [number]: boolean })
@@ -1809,6 +1941,8 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				if new_p then
 					user_pane = new_p
 					last_user_pane_by_tab[tab_id] = new_p
+					-- The split just took half the sidebar's share: force the pinned ratio back.
+					synced_tab_ratio[tab_id] = nil
 				end
 			end
 		end
@@ -1842,6 +1976,7 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 			save_state()
 			painted_fp[spane] = fp
 			place_sidebar_at_edge(cx, spane, tab_id, persisted.side, persisted.ratio)
+			refocus_terminal(cx, tab_id, owned_canvases(cx))
 			-- Schedule fast follow-up hydrations for remote SSH hosts where tern.canvas starts asynchronously
 			for _, delay_ms in ipairs({ 150, 400, 900 }) do
 				tern.timer(delay_ms, function(timer_cx: WindowCx?)
@@ -1851,7 +1986,10 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				end)
 			end
 		else
-			place_sidebar_at_edge(cx, spane, tab_id, persisted.side, persisted.ratio)
+			local moved_tabs = place_sidebar_at_edge(cx, spane, tab_id, persisted.side, persisted.ratio)
+			if moved_tabs or not last_drag_active then
+				refocus_terminal(cx, tab_id, data.owned)
+			end
 			if force_paint or painted_fp[spane] ~= fp or needs_hydration(cx, spane) then
 				cx.canvas:set(spane, {
 					title = SIDEBAR_TITLE,
@@ -1862,6 +2000,7 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				painted_fp[spane] = fp
 			end
 		end
+		active_sidebar_pane = spane
 		for other_pane, _ in pairs(live_host_canvases(cx)) do
 			if other_pane ~= spane and (force_paint or painted_fp[other_pane] ~= fp) then
 				pcall(function()
@@ -1875,8 +2014,6 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				end)
 			end
 		end
-
-		refocus_terminal(cx, tab_id, owned_canvases(cx))
 		last_active_session_id = data.active_session_id
 		last_active_tab_id = tab_id
 	end)
@@ -1886,6 +2023,72 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 		tern.log.warn("sidebar2 sync error:", tostring(err))
 	end
 	pcall(tern.chrome.refresh)
+end
+
+-- Close one tab without letting the sidebar ride along: it moves to the nearest sibling tab of
+-- the same session first, then the tab's own panes close one by one.
+local function close_tab_safely(cx: WindowCx, tid: number, hint_sess_id: number?)
+	local target_sess: number? = nil
+	local ok_t, tlist = pcall(function()
+		return cx.session:tabs()
+	end)
+	if ok_t and type(tlist) == "table" then
+		for _, t in ipairs(tlist) do
+			if t.id == tid then
+				target_sess = t.session
+				break
+			end
+		end
+	end
+	if not target_sess then
+		target_sess = hint_sess_id
+	end
+
+	local owned = owned_canvases(cx)
+	local sibling_tid = find_best_sibling_tab(cx, target_sess, tid, owned)
+	if sibling_tid then
+		for spane, _ in pairs(owned) do
+			if cx.session:tab_of(spane) == tid then
+				synced_tab_ratio[tid] = nil
+				synced_tab_ratio[sibling_tid] = nil
+				place_sidebar_at_edge(cx, spane, sibling_tid, persisted.side, persisted.ratio)
+			end
+		end
+		if target_sess == last_active_session_id and tid == last_active_tab_id then
+			local u = first_user_pane(cx, sibling_tid, owned)
+			if u then
+				last_user_pane_by_tab[sibling_tid] = u
+				pcall(function()
+					cx.layout:focus(u)
+				end)
+			end
+		end
+	end
+
+	local to_close: { [number]: boolean } = {}
+	for _, pid in ipairs(tab_all_panes(cx, tid)) do
+		if not owned[pid] then
+			to_close[pid] = true
+		end
+	end
+	local ok_p, plist = pcall(function()
+		return cx.session:panes()
+	end)
+	if ok_p and type(plist) == "table" then
+		for _, p in ipairs(plist) do
+			if p.tab == tid and not owned[p.pane] then
+				to_close[p.pane] = true
+			end
+		end
+	end
+	for pid, _ in pairs(to_close) do
+		pcall(function()
+			cx.layout:close(pid)
+		end)
+	end
+	synced_tab_ratio[tid] = nil
+	last_user_pane_by_tab[tid] = nil
+	sync_and_render(cx, true)
 end
 
 -- ---------------------------------------------------------------------------
@@ -2390,57 +2593,7 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	elseif cmd == "close_tab" or cmd == "Close Tab" then
 		local tid = tonumber(val) or (if nctx then nctx.tab_id else nil)
 		if tid then
-			local owned = owned_canvases(cx)
-			-- If sidebar canvas is inside this tab, move it to a sibling tab first
-			local ok_t, tlist = pcall(function()
-				return cx.session:tabs()
-			end)
-			local target_sess = if nctx then nctx.sess_id else nil
-			local sibling_tid: number? = nil
-			if ok_t and type(tlist) == "table" then
-				for _, t in ipairs(tlist) do
-					if t.id == tid and not target_sess then
-						target_sess = t.session
-					end
-				end
-				for _, t in ipairs(tlist) do
-					if t.session == target_sess and t.id ~= tid then
-						sibling_tid = t.id
-						break
-					end
-				end
-			end
-			if sibling_tid then
-				for spane, _ in pairs(owned) do
-					if cx.session:tab_of(spane) == tid then
-						pcall(function()
-							cx.layout:move_to_tab(spane, sibling_tid, { focus = false })
-						end)
-					end
-				end
-			end
-			local to_close: { [number]: boolean } = {}
-			for _, pid in ipairs(tab_all_panes(cx, tid)) do
-				if not owned[pid] then
-					to_close[pid] = true
-				end
-			end
-			local ok_p, plist = pcall(function()
-				return cx.session:panes()
-			end)
-			if ok_p and type(plist) == "table" then
-				for _, p in ipairs(plist) do
-					if p.tab == tid and not owned[p.pane] then
-						to_close[p.pane] = true
-					end
-				end
-			end
-			for pid, _ in pairs(to_close) do
-				pcall(function()
-					cx.layout:close(pid)
-				end)
-			end
-			sync_and_render(cx, true)
+			close_tab_safely(cx, tid, if nctx then nctx.sess_id else nil)
 		end
 		return true
 	elseif cmd == "split_right" or cmd == "Split Right" then
@@ -2667,10 +2820,6 @@ local function start_watcher()
 				local cur_sid = if ok_cs and cur_s then cur_s.id else nil
 				local f = cx.session:focused()
 				local cur_tid = if f then cx.session:tab_of(f) else nil
-				local owned = owned_canvases(cx)
-				if f and owned[f] then
-					refocus_terminal(cx, cur_tid, owned)
-				end
 				if cur_sid ~= last_active_session_id or (cur_tid and cur_tid ~= last_active_tab_id) then
 					sync_and_render(cx, false)
 				else
@@ -2678,7 +2827,10 @@ local function start_watcher()
 					local fp = build_fingerprint(data)
 					local cur_host = if ok_cs and cur_s then cur_s.host else 0
 					local spane = find_host_sidebar(cx, cur_host, data.active_tab_id, data.owned)
-					if not spane or painted_fp[spane] ~= fp or needs_hydration(cx, spane) then
+					if not spane then
+						active_sidebar_pane = nil
+						sync_and_render(cx, true)
+					elseif painted_fp[spane] ~= fp or needs_hydration(cx, spane) then
 						sync_and_render(cx, true)
 					elseif data.active_tab_id then
 						place_sidebar_at_edge(cx, spane, data.active_tab_id, persisted.side, persisted.ratio)
@@ -2714,14 +2866,18 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	pane_notif[ev.pane] = nil
 	ack_alerts[ev.pane] = true
 	local owned = owned_canvases(cx)
-	if owned[ev.pane] then
-		refocus_terminal(cx, ev.tab, owned)
-	else
+	if not owned[ev.pane] then
 		last_user_pane_by_tab[ev.tab] = ev.pane
 	end
-	if persisted.visible then
-		sync_and_render(cx, false)
+	if not persisted.visible then
+		return
 	end
+	-- Clicking the canvas must not repaint (that would swallow its context menu); it only needs a
+	-- sync when its tab lost every user pane.
+	if owned[ev.pane] and ev.tab == last_active_tab_id and first_user_pane(cx, ev.tab, owned) ~= nil then
+		return
+	end
+	sync_and_render(cx, false)
 end)
 
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
@@ -2754,11 +2910,39 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	end
 end)
 
+tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
+	if type(ev) == "table" and type(ev.pane) == "number" then
+		local pid = ev.pane
+		local pkey = tostring(pid)
+		if closing_internally[pid] then
+			closing_internally[pid] = nil
+		elseif
+			pid == active_sidebar_pane
+			or persisted.owned_panes[pkey]
+			or painted_fp[pid] ~= nil
+			or opened_at_ms[pid] ~= nil
+		then
+			-- The tab closed the canvas with it (native × on the tab): forget it and let the sync
+			-- below remount the sidebar on the active tab, still at the pinned edge and ratio.
+			closing_internally[pid] = nil
+			if pid == active_sidebar_pane then
+				active_sidebar_pane = nil
+			end
+			persisted.owned_panes[pkey] = nil
+			painted_fp[pid] = nil
+			opened_at_ms[pid] = nil
+			save_state()
+		end
+	end
+	if not busy_lock and persisted.visible then
+		sync_and_render(cx, true)
+	end
+end)
+
 for _, ev_name in ipairs({
 	"tab_created",
 	"tab_closed",
 	"pane_created",
-	"pane_closed",
 	"command_started",
 	"command_finished",
 	"title",
@@ -2770,3 +2954,40 @@ for _, ev_name in ipairs({
 		end
 	end)
 end
+
+-- Built-in closes must not drag the canvas into another tab's right half, nor close it at all.
+pcall(tern.override, "close_tab", function(cx: WindowCx): boolean?
+	if busy_lock or not persisted.visible then
+		return nil
+	end
+	local f = cx.session:focused()
+	local tid = last_active_tab_id or (if f then cx.session:tab_of(f) else nil)
+	if not tid then
+		return nil
+	end
+	close_tab_safely(cx, tid, last_active_session_id)
+	return true
+end)
+
+pcall(tern.override, "close_pane", function(cx: WindowCx): boolean?
+	if busy_lock or not persisted.visible then
+		return nil
+	end
+	local f = cx.session:focused()
+	if not f then
+		return nil
+	end
+	local owned = owned_canvases(cx)
+	if not owned[f] then
+		return nil
+	end
+	local tid = cx.session:tab_of(f)
+	local u = if tid then first_user_pane(cx, tid, owned) else nil
+	if not u then
+		return nil
+	end
+	pcall(function()
+		cx.layout:close(u)
+	end)
+	return true
+end)
