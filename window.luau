@@ -78,7 +78,9 @@ local function load_state(): PersistedState
 		fold_groups = if type(tbl.fold_groups) == "table" then tbl.fold_groups else {},
 		fold_sessions = if type(tbl.fold_sessions) == "table" then tbl.fold_sessions else {},
 		fold_tabs = if type(tbl.fold_tabs) == "table" then tbl.fold_tabs else {},
-		owned_panes = if type(tbl.owned_panes) == "table" then tbl.owned_panes else {},
+		-- Ignored on load: another window writes its own pane ids here, and trusting them made this
+		-- window claim, move or close a canvas it does not own.
+		owned_panes = {},
 	}
 end
 
@@ -183,9 +185,10 @@ local function owned_canvases(cx: WindowCx): { [number]: boolean }
 	end)
 	if ok_p and type(plist) == "table" then
 		for _, p in ipairs(plist) do
-			local pkey = tostring(p.pane)
+			-- Identity only: pane ids saved by another window's copy of this plugin must never make a
+			-- foreign pane ours (that is how a sidebar got moved or closed from the wrong window).
 			local is_canvas = (p.kind == "canvas" or p.program == "tern.canvas" or p.block == "tern.canvas" or p.block == "plugin.tern.canvas")
-			if persisted.owned_panes[pkey] or (is_canvas and (p.title == SIDEBAR_TITLE or p.title == "Canvas")) then
+			if is_canvas and (p.title == SIDEBAR_TITLE or p.title == "Canvas" or p.title == "TestRemoteCanvas") then
 				map[p.pane] = true
 			end
 		end
@@ -224,8 +227,11 @@ local function close_stale_canvases(cx: WindowCx, active_host_id: number?)
 			local pkey = tostring(p.pane)
 			existing[pkey] = true
 			if (not on_host or on_host[p.pane]) and not live[p.pane] then
+				-- `tern.now()` counts seconds. A canvas that no runtime registered yet is still
+				-- hydrating: only give up on it once the grace passed AND it sits in no tab.
 				local opened_t = opened_at_ms[p.pane]
-				if not opened_t or (now - opened_t) > 2500 then
+				local cooling = opened_t ~= nil and (now - opened_t) < 2.5
+				if not cooling and cx.session:tab_of(p.pane) == nil then
 					local is_canvas = (p.kind == "canvas" or p.program == "tern.canvas" or p.block == "tern.canvas" or p.block == "plugin.tern.canvas")
 					if persisted.owned_panes[pkey] or (is_canvas and (p.title == SIDEBAR_TITLE or p.title == "Canvas" or p.title == "TestRemoteCanvas")) then
 						persisted.owned_panes[pkey] = nil
@@ -254,7 +260,7 @@ end
 
 local function needs_hydration(cx: WindowCx, spane: number): boolean
 	local opened_t = opened_at_ms[spane]
-	if opened_t and (tern.now() - opened_t) < 2500 then
+	if opened_t and (tern.now() - opened_t) < 2.5 then
 		return true
 	end
 	local ok_p, pinfo = pcall(function()
@@ -1180,10 +1186,10 @@ local function build_view(data: CollectedData): (Node, Node)
 					reg_node("drop_s_" .. sess.skey, sctx)
 
 					local l1_menu: { string } = {
+						"New Tab",
+						"",
 						"Focus Session",
 						"Rename Session",
-						"",
-						"New Tab",
 						"",
 						"Move to TODO",
 						"Move to PROCESSING",
@@ -1323,11 +1329,11 @@ local function build_view(data: CollectedData): (Node, Node)
 							reg_node("drop_t_" .. tkey, tctx)
 
 							local l2_menu: { string } = {
-								"Focus Tab",
-								"Rename Tab",
-								"",
 								"New Tab",
 								"Close Tab",
+								"",
+								"Focus Tab",
+								"Rename Tab",
 							}
 							if can_reorder_tabs then
 								table.insert(l2_menu, "")
@@ -1626,9 +1632,17 @@ local function find_host_sidebar(
 	cx: WindowCx,
 	host_id: number,
 	active_tab_id: number?,
-	_owned: { [number]: boolean }
+	owned: { [number]: boolean }
 ): number?
 	local live = live_host_canvases(cx)
+	-- A canvas spawned a moment ago has no runtime entry yet; counting it keeps every later sync
+	-- from opening a second one (spawn/close churn made the sidebar flicker away). Only panes that
+	-- still sit in a tab qualify: ids left over in kv.json are not canvases and painting them throws.
+	for pid, _ in pairs(owned) do
+		if cx.session:tab_of(pid) ~= nil then
+			live[pid] = true
+		end
+	end
 	local host_pane_set = host_pane_map(cx, host_id)
 
 	local chosen: number? = nil
@@ -1892,6 +1906,56 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 			return
 		end
 		ensure_drag_helper()
+		-- A session with no tabs shows Tern's "No Terminals open" and has nothing to hold the
+		-- sidebar: hand the window to a session that still has tabs.
+		pcall(function()
+			local ok_t, tlist = pcall(function()
+				return cx.session:tabs()
+			end)
+			local ok_cur, cur = pcall(function()
+				return cx.sessions:current()
+			end)
+			if not ok_t or type(tlist) ~= "table" or not ok_cur or not cur then
+				return
+			end
+			local cur_has_tab = false
+			for _, t in ipairs(tlist) do
+				if t.session == cur.id then
+					cur_has_tab = true
+					break
+				end
+			end
+			if cur_has_tab then
+				return
+			end
+			local same_host: { [number]: boolean } = {}
+			local ok_ss, slist = pcall(function()
+				return cx.sessions:list()
+			end)
+			if ok_ss and type(slist) == "table" then
+				for _, si in ipairs(slist) do
+					if si.host == cur.host then
+						same_host[si.id] = true
+					end
+				end
+			end
+			local target: number? = nil
+			local fallback: number? = nil
+			for _, t in ipairs(tlist) do
+				if t.session ~= cur.id then
+					if same_host[t.session] then
+						target = t.session
+						break
+					elseif not fallback then
+						fallback = t.session
+					end
+				end
+			end
+			local pick = target or fallback
+			if pick then
+				cx.sessions:switch(pick)
+			end
+		end)
 		local ok_cs, cur_sess = pcall(function()
 			return cx.sessions:current()
 		end)
@@ -1904,26 +1968,6 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 		-- Clean up any orphan sidebar-only tab left behind after closing a tab's last terminal
 		cleanup_orphan_sidebar_tabs(cx, owned, active_sess_id)
 		owned = owned_canvases(cx)
-		-- If current session has 0 tabs (e.g. empty session), open a default tab so the sidebar can mount
-		if active_sess_id then
-			local ok_t, tlist = pcall(function()
-				return cx.session:tabs()
-			end)
-			local sess_tab_count = 0
-			if ok_t and type(tlist) == "table" then
-				for _, t in ipairs(tlist) do
-					if t.session == active_sess_id then
-						sess_tab_count += 1
-					end
-				end
-			end
-			if sess_tab_count == 0 then
-				pcall(function()
-					cx.layout:new_tab(nil, { focus = true })
-				end)
-				owned = owned_canvases(cx)
-			end
-		end
 
 		local data = collect_data(cx)
 		local tab_id = data.active_tab_id
@@ -1933,20 +1977,19 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 
 		local user_pane = first_user_pane(cx, tab_id, data.owned)
 		if not user_pane then
-			-- Only sidebar in the only tab of this session: split a terminal pane beside it
-			local all_p = tab_all_panes(cx, tab_id)
-			if #all_p > 0 then
-				local term_dir: Dir = if persisted.side == "left" then "right" else "left"
-				local new_p = cx.layout:split(all_p[1], term_dir, nil, { focus = true })
-				if new_p then
-					user_pane = new_p
-					last_user_pane_by_tab[tab_id] = new_p
-					-- The split just took half the sidebar's share: force the pinned ratio back.
-					synced_tab_ratio[tab_id] = nil
+			-- A tab whose last user pane closed is closing: take the canvas with it instead of
+			-- splitting a fresh terminal in, so a closed tab never comes back on its own.
+			for pid, _ in pairs(data.owned) do
+				if cx.session:tab_of(pid) == tab_id then
+					closing_internally[pid] = true
+					persisted.owned_panes[tostring(pid)] = nil
+					painted_fp[pid] = nil
+					opened_at_ms[pid] = nil
+					pcall(function()
+						cx.layout:close(pid)
+					end)
 				end
 			end
-		end
-		if not user_pane then
 			return
 		end
 
@@ -1991,13 +2034,21 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				refocus_terminal(cx, tab_id, data.owned)
 			end
 			if force_paint or painted_fp[spane] ~= fp or needs_hydration(cx, spane) then
-				cx.canvas:set(spane, {
-					title = SIDEBAR_TITLE,
-					about = SIDEBAR_ABOUT,
-					view = view,
-					dock = dock,
-				})
-				painted_fp[spane] = fp
+				-- The canvas runtime may still be coming up right after a spawn: a failed paint just
+				-- retries on the next sync, and keeps the pane (and its spawn grace) alive.
+				local ok_set = pcall(function()
+					cx.canvas:set(spane, {
+						title = SIDEBAR_TITLE,
+						about = SIDEBAR_ABOUT,
+						view = view,
+						dock = dock,
+					})
+				end)
+				if ok_set then
+					painted_fp[spane] = fp
+				else
+					painted_fp[spane] = nil
+				end
 			end
 		end
 		active_sidebar_pane = spane
@@ -2067,7 +2118,7 @@ local function close_tab_safely(cx: WindowCx, tid: number, hint_sess_id: number?
 
 	local to_close: { [number]: boolean } = {}
 	for _, pid in ipairs(tab_all_panes(cx, tid)) do
-		if not owned[pid] then
+		if sibling_tid or not owned[pid] then
 			to_close[pid] = true
 		end
 	end
@@ -2076,12 +2127,18 @@ local function close_tab_safely(cx: WindowCx, tid: number, hint_sess_id: number?
 	end)
 	if ok_p and type(plist) == "table" then
 		for _, p in ipairs(plist) do
-			if p.tab == tid and not owned[p.pane] then
+			if p.tab == tid and (sibling_tid or not owned[p.pane]) then
 				to_close[p.pane] = true
 			end
 		end
 	end
 	for pid, _ in pairs(to_close) do
+		if owned[pid] then
+			closing_internally[pid] = true
+			persisted.owned_panes[tostring(pid)] = nil
+			painted_fp[pid] = nil
+			opened_at_ms[pid] = nil
+		end
 		pcall(function()
 			cx.layout:close(pid)
 		end)
@@ -2803,42 +2860,74 @@ local function start_watcher()
 	watcher_started = true
 
 	local function drag_step(cx: WindowCx?)
-		if cx then
-			poll_drag_ipc(cx)
-		end
+		-- Reschedule first: a failing poll must never end the watch loop.
 		tern.timer(80, drag_step)
+		if cx then
+			local ok, err = pcall(poll_drag_ipc, cx)
+			if not ok then
+				tern.log.warn("sidebar2 drag watcher error:", tostring(err))
+			end
+		end
 	end
 	tern.timer(80, drag_step)
 
-	local function step(cx: WindowCx?)
-		if cx and not busy_lock then
-			if persisted.visible then
-				ensure_drag_helper()
-				local ok_cs, cur_s = pcall(function()
-					return cx.sessions:current()
+	local function step_body(cx: WindowCx)
+		if persisted.visible then
+			ensure_drag_helper()
+			local ok_cs, cur_s = pcall(function()
+				return cx.sessions:current()
+			end)
+			local cur_sid = if ok_cs and cur_s then cur_s.id else nil
+			local has_tab = false
+			if cur_sid then
+				local ok_t, tlist = pcall(function()
+					return cx.session:tabs()
 				end)
-				local cur_sid = if ok_cs and cur_s then cur_s.id else nil
-				local f = cx.session:focused()
-				local cur_tid = if f then cx.session:tab_of(f) else nil
-				if cur_sid ~= last_active_session_id or (cur_tid and cur_tid ~= last_active_tab_id) then
-					sync_and_render(cx, false)
-				else
-					local data = collect_data(cx)
-					local fp = build_fingerprint(data)
-					local cur_host = if ok_cs and cur_s then cur_s.host else 0
-					local spane = find_host_sidebar(cx, cur_host, data.active_tab_id, data.owned)
-					if not spane then
-						active_sidebar_pane = nil
-						sync_and_render(cx, true)
-					elseif painted_fp[spane] ~= fp or needs_hydration(cx, spane) then
-						sync_and_render(cx, true)
-					elseif data.active_tab_id then
-						place_sidebar_at_edge(cx, spane, data.active_tab_id, persisted.side, persisted.ratio)
+				if ok_t and type(tlist) == "table" then
+					for _, t in ipairs(tlist) do
+						if t.session == cur_sid then
+							has_tab = true
+							break
+						end
+					end
+				end
+			end
+			local f = cx.session:focused()
+			local cur_tid = if f then cx.session:tab_of(f) else nil
+			-- `not has_tab`: the shown session lost its last tab, so the sync must follow the
+			-- sessions that still have tabs instead of sitting on an empty one.
+			if not has_tab or cur_sid ~= last_active_session_id or not cur_tid or cur_tid ~= last_active_tab_id then
+				sync_and_render(cx, false)
+			else
+				local data = collect_data(cx)
+				local fp = build_fingerprint(data)
+				local cur_host = if ok_cs and cur_s then cur_s.host else 0
+				local spane = find_host_sidebar(cx, cur_host, data.active_tab_id, data.owned)
+				if data.active_tab_id and not spane then
+					active_sidebar_pane = nil
+					sync_and_render(cx, true)
+				elseif spane and (painted_fp[spane] ~= fp or needs_hydration(cx, spane)) then
+					sync_and_render(cx, true)
+				elseif data.active_tab_id then
+					place_sidebar_at_edge(cx, spane, data.active_tab_id, persisted.side, persisted.ratio)
+					if cx.session:focused() == spane then
+						refocus_terminal(cx, data.active_tab_id, data.owned)
 					end
 				end
 			end
 		end
+	end
+
+	local function step(cx: WindowCx?)
+		-- Reschedule first: one throw must not end the loop; it used to leave the sidebar gone for good.
 		tern.timer(250, step)
+		if not (cx and not busy_lock) then
+			return
+		end
+		local ok, err = pcall(step_body, cx)
+		if not ok then
+			tern.log.warn("sidebar2 watcher error:", tostring(err))
+		end
 	end
 	tern.timer(250, step)
 end
