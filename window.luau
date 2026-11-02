@@ -100,6 +100,12 @@ end)
 
 -- Runtime state (per window VM)
 local busy_lock = false
+-- Remote daemons cannot host canvases (Tern 0.9.9: `canvas:open` returns a pane id, then every
+-- `set` fails with "pane is not a canvas"), which left a blank strip nobody could remove. A host
+-- that refused is remembered by the Tern version it refused with, and retried only when that
+-- version changes, so no pane is respawned on every sync.
+local canvas_refused: { [number]: string } = {}
+local last_refusal_warn_s = 0
 local picked_skey: string? = nil
 local hover_group: GroupId? = nil
 local hover_sess_pos: number? = nil
@@ -258,6 +264,30 @@ local function close_stale_canvases(cx: WindowCx, active_host_id: number?)
 	end
 	if dirty then
 		save_state()
+	end
+end
+
+-- Forget a pane the canvas runtime refuses and close it, so no blank strip is left behind.
+local function drop_sidebar_pane(cx: WindowCx, spane: number)
+	painted_fp[spane] = nil
+	painted_sec_fp[spane] = nil
+	opened_at_ms[spane] = nil
+	persisted.owned_panes[tostring(spane)] = nil
+	closing_internally[spane] = true
+	active_sidebar_pane = nil
+	save_state()
+	pcall(function()
+		cx.layout:close(spane)
+	end)
+end
+
+local function canvas_host_ready(host_id: number, tern_version: string): boolean
+	return canvas_refused[host_id] ~= tern_version
+end
+
+local function refuse_canvas_on_host(host_id: number, tern_version: string)
+	if tern_version ~= "" then
+		canvas_refused[host_id] = tern_version
 	end
 end
 
@@ -2032,6 +2062,16 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 		local active_sess_id = if ok_cs and cur_sess then cur_sess.id else nil
 		local active_host_id = if ok_cs and cur_sess then cur_sess.host else 0
 
+		local active_host_kind = "local"
+		local active_host_tern = ""
+		pcall(function()
+			local h = cx.hosts:current()
+			if h then
+				active_host_kind = h.kind
+				active_host_tern = if type(h.tern) == "string" then h.tern else ""
+			end
+		end)
+
 		close_stale_canvases(cx, active_host_id)
 		local owned = owned_canvases(cx)
 
@@ -2088,6 +2128,9 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 		end
 
 		if not spane then
+			if not canvas_host_ready(active_host_id, active_host_tern) then
+				return
+			end
 			local opened_pane, open_err = cx.canvas:open({
 				title = SIDEBAR_TITLE,
 				about = SIDEBAR_ABOUT,
@@ -2100,7 +2143,8 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				dock = dock,
 			})
 			if not opened_pane then
-				tern.log.debug("sidebar2: canvas:open skipped:", tostring(open_err))
+				refuse_canvas_on_host(active_host_id, active_host_tern)
+				tern.log.warn("sidebar2: canvas unavailable on this host:", tostring(open_err))
 				return
 			end
 			spane = opened_pane
@@ -2147,7 +2191,7 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 					end
 				end
 				if not painted then
-					painted = pcall(function()
+					local ok_full, full_err = pcall(function()
 						cx.canvas:set(spane, {
 							title = SIDEBAR_TITLE,
 							about = SIDEBAR_ABOUT,
@@ -2155,6 +2199,36 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 							dock = dock,
 						})
 					end)
+					painted = ok_full
+					if not ok_full then
+						-- A canvas that just spawned may still be hydrating; a paint past that grace
+						-- failing means the pane the runtime opened on this host is a plain pane,
+						-- not a canvas: close it instead of repainting a blank strip every sync.
+						local opened_t = opened_at_ms[spane]
+						local hydrating = opened_t ~= nil and (tern.now() - opened_t) < 2500
+						if hydrating then
+							tern.log.debug("sidebar2: canvas still hydrating:", tostring(full_err))
+						else
+							-- Only a pane this VM opened proves the host cannot host canvases; one
+							-- left behind by an older build just goes, so the next sync opens a
+							-- fresh canvas instead of writing the host off.
+							if opened_t ~= nil then
+								refuse_canvas_on_host(active_host_id, active_host_tern)
+							end
+							if tern.now() - last_refusal_warn_s > 60_000 then
+								last_refusal_warn_s = tern.now()
+								tern.log.warn(
+									"sidebar2: canvas refused on host",
+									active_host_id,
+									active_host_kind,
+									":",
+									tostring(full_err)
+								)
+							end
+							drop_sidebar_pane(cx, spane)
+							return
+						end
+					end
 				end
 				if painted then
 					painted_fp[spane] = fp

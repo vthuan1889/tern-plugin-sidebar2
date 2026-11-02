@@ -107,6 +107,15 @@ The strip is a canvas pane pinned to the left edge of the active tab at **20%** 
 you when you switch sessions, tabs or hosts, one strip per host. The `R` / `L` toolbar button moves it to
 the other edge.
 
+A canvas pane lives in the session's daemon, so a **remote host must run a Tern new enough to host
+canvases** (0.9.9 or later). An older host reports no error: `canvas:open` hands back a plain pane and
+every paint fails with `pane is not a canvas`. The plugin then closes that pane and stops trying on that
+host until its Tern version changes, so you get no strip at all rather than a blank one. Fix it with:
+
+```sh
+tern remote update <host>   # per remote host, from the window's own Tern version
+```
+
 Width is fixed, not drag-resizable.
 
 ## Persistence
@@ -135,6 +144,8 @@ Because the column key includes the session **name**, renaming a session resets 
 ## Troubleshooting
 
 - Sidebar gone → click the `Kanban: OFF` status-bar segment, or `tern plugin reload sidebar2`.
+- Sidebar missing on a remote session → that host's Tern cannot host canvases; run
+  `tern remote update <host>` (see [Placement](#placement)).
 - Two strips in one tab → the plugin cleans up stale canvases 2.5 s after a pane is created; use the
   refresh button to force a re-render, or close the extra canvas like any pane.
 - Plugin not listed → `tern plugin list`, then check `plugins_disabled` in Tern's settings.
