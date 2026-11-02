@@ -2164,6 +2164,14 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				end)
 			end
 		else
+			-- A pane left behind by a daemon without canvas support keeps its default title and
+			-- draws nothing, yet the hub may accept updates for it forever. It was not opened by
+			-- this VM, so close it: the next sync spawns a real canvas on this host.
+			if opened_at_ms[spane] == nil and needs_hydration(cx, spane) then
+				tern.log.warn("sidebar2: closing a sidebar pane that never drew", spane)
+				drop_sidebar_pane(cx, spane)
+				return
+			end
 			local moved_tabs = place_sidebar_at_edge(cx, spane, tab_id, persisted.side, persisted.ratio)
 			if moved_tabs or not last_drag_active then
 				refocus_terminal(cx, tab_id, data.owned)
