@@ -1,36 +1,52 @@
 -- sidebar2/window.luau
--- Fixed Kanban Sidebar (TODO / Processing / DONE) with 3-Level Hierarchy:
---   Level 1: Host + Session name (movable between TODO, Processing, DONE)
+-- Fixed Kanban Sidebar (TODO / WORKING / REVIEW / PAUSED / STUCK / DONE) with 3-Level Hierarchy:
+--   Level 1: Host + Session name (movable between every stage)
 --   Level 2: Tabs in each session
 --   Level 3: Panes in each tab
 
 local ui = tern.ui
 
 local SIDEBAR_TITLE = "Kanban"
-local SIDEBAR_ABOUT = "Fixed Kanban sidebar (TODO / Processing / DONE) organizing Host + Session, Tabs, and Panes."
--- Pinned width like Tern's Settings pane: only ⇄ (flip_side) changes side, nothing changes width.
+local SIDEBAR_ABOUT = "Fixed Kanban sidebar (TODO / WORKING / REVIEW / PAUSED / STUCK / DONE) organizing Host + Session, Tabs, and Panes."
+-- Width until a divider is dragged; from then on the dragged ratio is what every session gets.
 local FIXED_SIDEBAR_RATIO = 0.20
+local MIN_SIDEBAR_RATIO = 0.08
+local MAX_SIDEBAR_RATIO = 0.60
 
-type GroupId = "todo" | "doing" | "done"
+type GroupId = "todo" | "doing" | "review" | "paused" | "stuck" | "done"
 
 type GroupSpec = {
 	id: GroupId,
 	label: string,
 	short: string,
 	tone: string,
+	icon: string,
 	next_id: GroupId,
 }
 
 local GROUPS: { GroupSpec } = {
-	{ id = "todo", label = "TODO", short = "TODO", tone = "info", next_id = "doing" },
-	{ id = "doing", label = "PROCESSING", short = "DOING", tone = "warning", next_id = "done" },
-	{ id = "done", label = "DONE", short = "DONE", tone = "success", next_id = "todo" },
+	{ id = "todo", label = "TODO", short = "TODO", tone = "info", icon = "inbox", next_id = "doing" },
+	{ id = "doing", label = "WORKING", short = "WORKING", tone = "warning", icon = "activity", next_id = "review" },
+	{ id = "review", label = "REVIEW", short = "REVIEW", tone = "info", icon = "eye", next_id = "paused" },
+	{ id = "paused", label = "PAUSED", short = "PAUSED", tone = "neutral", icon = "pause", next_id = "stuck" },
+	{ id = "stuck", label = "STUCK", short = "STUCK", tone = "warning", icon = "warn", next_id = "done" },
+	{ id = "done", label = "DONE", short = "DONE", tone = "success", icon = "check", next_id = "todo" },
 }
 
 local GROUP_BY_ID: { [ string ]: GroupSpec } = {}
 for _, g in ipairs(GROUPS) do
 	GROUP_BY_ID[g.id] = g
 end
+
+type BadgeKey = "total" | "running" | "idle" | "hide_zero"
+
+type BadgeVis = {
+	total: boolean,
+	running: boolean,
+	idle: boolean,
+	-- Hide a count badge whose value is 0 instead of showing "0".
+	hide_zero: boolean,
+}
 
 type PersistedState = {
 	visible: boolean,
@@ -43,7 +59,11 @@ type PersistedState = {
 	fold_groups: { [string]: boolean },
 	fold_sessions: { [string]: boolean },
 	fold_tabs: { [string]: boolean },
+	marked_tabs: { [string]: boolean },
 	owned_panes: { [string]: boolean },
+	badge_vis: BadgeVis,
+	stage_vis: { [string]: boolean },
+	hide_empty: boolean,
 }
 
 local function clamp(v: number, lo: number, hi: number): number
@@ -65,8 +85,17 @@ local function load_state(): PersistedState
 		visible = tbl.auto_open
 	end
 	local side: "left" | "right" = if tbl.side == "right" then "right" else "left"
-	local ratio = FIXED_SIDEBAR_RATIO
+	local ratio = if type(tbl.ratio) == "number"
+		then clamp(tbl.ratio, MIN_SIDEBAR_RATIO, MAX_SIDEBAR_RATIO)
+		else FIXED_SIDEBAR_RATIO
 	local cols_est = if type(tbl.cols_est) == "number" then clamp(tbl.cols_est, 60, 600) else 180
+	local raw_bv = if type(tbl.badge_vis) == "table" then tbl.badge_vis else {}
+	local badge_vis: BadgeVis = {
+		total = if type(raw_bv.total) == "boolean" then raw_bv.total else true,
+		running = if type(raw_bv.running) == "boolean" then raw_bv.running else true,
+		idle = if type(raw_bv.idle) == "boolean" then raw_bv.idle else true,
+		hide_zero = if type(raw_bv.hide_zero) == "boolean" then raw_bv.hide_zero else false,
+	}
 	return {
 		visible = visible,
 		side = side,
@@ -78,9 +107,14 @@ local function load_state(): PersistedState
 		fold_groups = if type(tbl.fold_groups) == "table" then tbl.fold_groups else {},
 		fold_sessions = if type(tbl.fold_sessions) == "table" then tbl.fold_sessions else {},
 		fold_tabs = if type(tbl.fold_tabs) == "table" then tbl.fold_tabs else {},
+		marked_tabs = if type(tbl.marked_tabs) == "table" then tbl.marked_tabs else {},
 		-- Ignored on load: another window writes its own pane ids here, and trusting them made this
 		-- window claim, move or close a canvas it does not own.
 		owned_panes = {},
+		badge_vis = badge_vis,
+		-- Absent means visible: a stage only hides once its pill is switched off.
+		stage_vis = if type(tbl.stage_vis) == "table" then tbl.stage_vis else {},
+		hide_empty = tbl.hide_empty == true,
 	}
 end
 
@@ -90,16 +124,11 @@ local function save_state()
 	pcall(tern.kv.set, "state", persisted)
 end
 
--- Overwrite the width an older build drifted to, so kv.json never carries a stale ratio again.
-pcall(function()
-	local ok_s, raw = pcall(tern.kv.get, "state")
-	if ok_s and type(raw) == "table" and raw.ratio ~= persisted.ratio then
-		save_state()
-	end
-end)
-
 -- Runtime state (per window VM)
 local busy_lock = false
+-- A sync that arrives mid-paint is dropped, and a hover frame dropped that way leaves the drag
+-- anchor line stale until the cursor crosses another slot; re-run it once the paint finishes.
+local render_pending = false
 -- Remote daemons cannot host canvases (Tern 0.9.9: `canvas:open` returns a pane id, then every
 -- `set` fails with "pane is not a canvas"), which left a blank strip nobody could remove. A host
 -- that refused is remembered by the Tern version it refused with, and retried only when that
@@ -163,11 +192,16 @@ end
 local opened_at_ms: { [number]: number } = {}
 local synced_tab_ratio: { [number]: number } = {}
 local last_user_pane_by_tab: { [number]: number } = {}
+-- Focus order for "start in" tie-breaks: higher means focused more recently.
+local focus_rank: { [number]: number } = {}
+local focus_rank_seq = 0
 local last_active_session_id: number? = nil
 local last_active_tab_id: number? = nil
 local last_active_tab_by_session: { [number]: number } = {}
 local current_stage_label = "TODO"
 local current_stage_tone = "info"
+local badge_cfg_open = false
+local stage_cfg_open = false
 
 -- ---------------------------------------------------------------------------
 -- Helper: Identify owned sidebar2 canvas panes
@@ -435,22 +469,49 @@ local function merge_status(a: ItemStatus, b: ItemStatus): ItemStatus
 	return a
 end
 
-local function is_ai_agent_pane(pinfo: PaneInfo, astate: string?): boolean
+-- Program/command name -> Tern icon; the first match wins.
+local AGENT_ICONS: { { string } } = {
+	{ "opencode", "provider-opencode" },
+	{ "omp", "app-omp" },
+	{ "claude", "app-claude" },
+	{ "codex", "app-codex" },
+	{ "hermes", "app-hermes" },
+	{ "gemini", "mi-gemini-ai" },
+	{ "copilot", "mi-copilot" },
+	{ "cursor", "mi-cursor" },
+	{ "cline", "mi-cline" },
+	{ "devin", "provider-devin" },
+	{ "kilo", "provider-kilo" },
+	{ "kimi", "provider-kimi-code" },
+	{ "qwen", "provider-qwen-portal" },
+	{ "deepseek", "provider-deepseek" },
+	{ "aider", "sparkle" },
+	{ "goose", "sparkle" },
+	{ "carly", "sparkle" },
+}
+
+local function agent_icon_from_text(s: string?): string?
+	if not s or s == "" then
+		return nil
+	end
+	local lower = string.lower(s)
+	for _, pair in ipairs(AGENT_ICONS) do
+		-- Word-bounded so "composer" and "prompt" do not read as omp.
+		if string.find(lower, "%f[%w]" .. pair[1] .. "%f[%W]") then
+			return pair[2]
+		end
+	end
+	return nil
+end
+
+local function is_ai_agent_pane(pinfo: PaneInfo, astate: string?, acmd: string?, tab_prog: string?): boolean
 	if astate ~= nil or pinfo.kind == "agent" or pinfo.kind == "carly" then
 		return true
 	end
-	local prog = string.lower(pinfo.program or "")
-	if
-		string.find(prog, "omp", 1, true)
-		or string.find(prog, "claude", 1, true)
-		or string.find(prog, "codex", 1, true)
-		or string.find(prog, "gemini", 1, true)
-		or string.find(prog, "aider", 1, true)
-		or string.find(prog, "opencode", 1, true)
-		or string.find(prog, "cursor", 1, true)
-		or string.find(prog, "goose", 1, true)
-		or string.find(prog, "copilot", 1, true)
-	then
+	if agent_icon_from_text(pinfo.program) or agent_icon_from_text(acmd) or agent_icon_from_text(tab_prog) then
+		return true
+	end
+	if pinfo.running and agent_icon_from_text(pinfo.running.line) then
 		return true
 	end
 	local ttl = pinfo.title or ""
@@ -468,6 +529,8 @@ type PaneEntry = {
 	err: boolean,
 	status: ItemStatus,
 	focused: boolean,
+	is_agent: boolean,
+	icon: string,
 }
 
 type TabEntry = {
@@ -478,6 +541,8 @@ type TabEntry = {
 	busy: boolean,
 	status: ItemStatus,
 	current: boolean,
+	icon: string,
+	has_agent: boolean,
 	panes: { PaneEntry },
 }
 
@@ -498,15 +563,43 @@ type SessionEntry = {
 	pane_count: number,
 }
 
+type GroupAgentCounts = {
+	total: number,
+	running: number,
+	idle: number,
+}
+
 type CollectedData = {
 	sessions: { SessionEntry },
 	by_group: { [GroupId]: { SessionEntry } },
 	by_skey: { [string]: SessionEntry },
+	group_counts: { [GroupId]: GroupAgentCounts },
 	active_session_id: number?,
 	active_tab_id: number?,
 	focused_pane: number?,
 	owned: { [number]: boolean },
 }
+
+-- Title glyphs an AI agent prefixes its own terminal title with: Nerd Font private-use icons and "✦".
+local function strip_leading_title_icon(s: string): string
+	local out = string.gsub(s, "^%s+", "")
+	while out ~= "" do
+		local ok, cp = pcall(utf8.codepoint, out, 1)
+		if not ok then
+			break
+		end
+		local glyph = (cp >= 0xE000 and cp <= 0xF8FF)
+			or (cp >= 0xF0000 and cp <= 0xFFFFD)
+			or (cp >= 0x100000 and cp <= 0x10FFFD)
+			or cp == 0x2726
+		if not glyph then
+			break
+		end
+		out = string.sub(out, (if cp < 0x80 then 1 elseif cp < 0x800 then 2 elseif cp < 0x10000 then 3 else 4) + 1)
+		out = string.gsub(out, "^%s+", "")
+	end
+	return out
+end
 
 local function short_text(s: string?, max_len: number): string
 	if not s or s == "" then
@@ -519,11 +612,43 @@ local function short_text(s: string?, max_len: number): string
 	return string.sub(clean, 1, max_len - 1) .. "…"
 end
 
+-- A tab shows its agent pane's icon: a busy one, else the focused one, else any.
+local function tab_agent_icon_of(panes: { PaneEntry }): string?
+	for _, p in ipairs(panes) do
+		if p.is_agent and p.busy then
+			return p.icon
+		end
+	end
+	for _, p in ipairs(panes) do
+		if p.is_agent and p.focused then
+			return p.icon
+		end
+	end
+	for _, p in ipairs(panes) do
+		if p.is_agent then
+			return p.icon
+		end
+	end
+	return nil
+end
+
 -- Tern's own icon set (208 names) instead of emoji glyphs: they scale, tone and align with the theme.
-local function pane_icon(kind: string): string
-	if kind == "agent" or kind == "carly" then
-		return "sparkle"
-	elseif kind == "file" then
+local function resolve_pane_icon(pinfo: PaneInfo, is_agent: boolean, acmd: string?, tab_prog: string?): string
+	if is_agent then
+		local icon = agent_icon_from_text(acmd)
+			or agent_icon_from_text(pinfo.running and pinfo.running.line)
+			or agent_icon_from_text(pinfo.program)
+			or agent_icon_from_text(tab_prog)
+			or agent_icon_from_text(pinfo.last and pinfo.last.line)
+			or agent_icon_from_text(pinfo.title)
+		if icon then
+			return icon
+		end
+		-- An agent block with nothing to name it runs omp; carly keeps the sparkle.
+		return if pinfo.kind == "carly" then "sparkle" else "app-omp"
+	end
+	local kind = pinfo.kind or "terminal"
+	if kind == "file" then
 		return "file-code"
 	elseif kind == "git" then
 		return "branch"
@@ -566,13 +691,19 @@ local function collect_data(cx: WindowCx): CollectedData
 
 	-- 2. Agent states
 	local agent_state_by_pane: { [number]: string } = {}
+	local agent_cmd_by_pane: { [number]: string } = {}
 	local ok_a, alist = pcall(function()
 		return cx.agents:list()
 	end)
 	if ok_a and type(alist) == "table" then
 		for _, a in ipairs(alist) do
-			if type(a.pane) == "number" and type(a.state) == "string" then
-				agent_state_by_pane[a.pane] = a.state
+			if type(a.pane) == "number" then
+				if type(a.state) == "string" then
+					agent_state_by_pane[a.pane] = a.state
+				end
+				if type(a.command) == "string" and a.command ~= "" then
+					agent_cmd_by_pane[a.pane] = a.command
+				end
 			end
 		end
 	end
@@ -712,12 +843,14 @@ local function collect_data(cx: WindowCx): CollectedData
 	end)
 
 	local sessions: { SessionEntry } = {}
-	local by_group: { [GroupId]: { SessionEntry } } = {
-		todo = {},
-		doing = {},
-		done = {},
-	}
+	-- Every stage GROUPS defines needs a bucket; a missing one made the whole sidebar fail to build.
+	local by_group: { [GroupId]: { SessionEntry } } = {}
 	local by_skey: { [string]: SessionEntry } = {}
+	local group_counts: { [GroupId]: GroupAgentCounts } = {}
+	for _, g in ipairs(GROUPS) do
+		by_group[g.id] = {}
+		group_counts[g.id] = { total = 0, running = 0, idle = 0 }
+	end
 	local state_dirty = false
 
 	for _, s in ipairs(raw_sessions) do
@@ -760,7 +893,11 @@ local function collect_data(cx: WindowCx): CollectedData
 					local pinfo = pane_info_by_id[pid]
 					if pinfo then
 						local astate = agent_state_by_pane[pid]
-						local is_agent = is_ai_agent_pane(pinfo, astate)
+						local acmd = agent_cmd_by_pane[pid]
+						-- Only a tab whose program names an agent tells its focused/only pane anything.
+						local tab_prog = if t.pane == pid or #ordered_ids <= 1 then t.program else nil
+						local is_agent = is_ai_agent_pane(pinfo, astate, acmd, tab_prog)
+						local picon = resolve_pane_icon(pinfo, is_agent, acmd, tab_prog)
 						local pbusy = if astate ~= nil
 							then (astate == "working")
 							else (pinfo.busy == true)
@@ -811,6 +948,11 @@ local function collect_data(cx: WindowCx): CollectedData
 							then pinfo.title
 							elseif pinfo.program and pinfo.program ~= "" then pinfo.program
 							else (pinfo.kind or "shell")
+						-- The row draws the agent's icon itself, so drop the one the program put in its title.
+						local stripped = strip_leading_title_icon(raw_title)
+						if stripped ~= "" then
+							raw_title = stripped
+						end
 						if not primary_user_title then
 							primary_user_title = raw_title
 						end
@@ -833,6 +975,8 @@ local function collect_data(cx: WindowCx): CollectedData
 							err = perr,
 							status = pstatus,
 							focused = pfocused,
+							is_agent = is_agent,
+							icon = picon,
 						})
 					end
 				end
@@ -850,6 +994,23 @@ local function collect_data(cx: WindowCx): CollectedData
 				elseif t.title and t.title ~= "" and t.title ~= SIDEBAR_TITLE then t.title
 				elseif t.program and t.program ~= "" then t.program
 				else ("Tab " .. tostring(idx))
+			local tab_stripped = strip_leading_title_icon(tab_title)
+			if tab_stripped ~= "" then
+				tab_title = tab_stripped
+			end
+
+			-- The tab shows its agent pane's icon: a busy one, else the focused one, else any.
+			local tab_agent_icon = tab_agent_icon_of(pane_entries) or agent_icon_from_text(t.program)
+			local tab_icon = tab_agent_icon
+			if not tab_icon then
+				for _, p in ipairs(pane_entries) do
+					if p.focused then
+						tab_icon = p.icon
+						break
+					end
+				end
+				tab_icon = tab_icon or (pane_entries[1] and pane_entries[1].icon) or "terminal"
+			end
 
 			-- Skip pure-sidebar transient tabs if there are other tabs in the session
 			local only_sidebar = (#pane_entries == 0 and #stabs > 1)
@@ -862,13 +1023,15 @@ local function collect_data(cx: WindowCx): CollectedData
 					busy = tab_busy,
 					status = tab_status_kind,
 					current = is_cur_sess and (t.id == active_tab_id),
+					icon = tab_icon,
+					has_agent = (tab_agent_icon ~= nil),
 					panes = pane_entries,
 				})
 			end
 		end
 
 		local grp: GroupId = persisted.groups[skey] or "todo"
-		if grp ~= "todo" and grp ~= "doing" and grp ~= "done" then
+		if not GROUP_BY_ID[grp] then
 			grp = "todo"
 		end
 		if sess_busy and grp == "todo" and not persisted.manual_groups[skey] then
@@ -877,6 +1040,20 @@ local function collect_data(cx: WindowCx): CollectedData
 			state_dirty = true
 		end
 		persisted.groups[skey] = grp
+
+		local gcounts = group_counts[grp]
+		for _, t in ipairs(tab_entries) do
+			for _, p in ipairs(t.panes) do
+				if p.is_agent then
+					gcounts.total += 1
+					if p.busy then
+						gcounts.running += 1
+					else
+						gcounts.idle += 1
+					end
+				end
+			end
+		end
 
 		if is_cur_sess then
 			local gspec = GROUP_BY_ID[grp] or GROUPS[1]
@@ -940,6 +1117,7 @@ local function collect_data(cx: WindowCx): CollectedData
 		sessions = sessions,
 		by_group = by_group,
 		by_skey = by_skey,
+		group_counts = group_counts,
 		active_session_id = active_session_id,
 		active_tab_id = active_tab_id,
 		focused_pane = focused,
@@ -950,7 +1128,15 @@ end
 -- ---------------------------------------------------------------------------
 -- View Fingerprint & Node Builder
 -- ---------------------------------------------------------------------------
-local SECTION_KEYS = { "toolbar", "group_todo", "group_doing", "group_done" }
+local SECTION_KEYS = { "toolbar" }
+for _, g in ipairs(GROUPS) do
+	table.insert(SECTION_KEYS, "group_" .. g.id)
+end
+
+-- A stage is drawn unless its pill is off or "hide empty" hides it while it holds no session.
+local function stage_hidden(g: GroupSpec, count: number): boolean
+	return persisted.stage_vis[g.id] == false or (persisted.hide_empty and count == 0)
+end
 
 -- Returns the whole-view fingerprint plus one fingerprint per direct child of `sidebar2_root`,
 -- so a render can patch only the sections whose content actually changed.
@@ -966,13 +1152,32 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 		tostring(data.active_session_id or 0),
 		tostring(data.active_tab_id or 0),
 		tostring(data.focused_pane or 0),
+		tostring(persisted.badge_vis.total),
+		tostring(persisted.badge_vis.running),
+		tostring(persisted.badge_vis.idle),
+		tostring(badge_cfg_open),
+		tostring(stage_cfg_open),
 	}
 	local sec_fp: { [string]: string } = {
 		toolbar = table.concat({ persisted.side, tostring(#data.sessions) }, "|"),
 	}
 	for _, g in ipairs(GROUPS) do
+		if stage_hidden(g, #(data.by_group[g.id] or {})) then
+			continue
+		end
 		local gfold = persisted.fold_groups[g.id] == true
-		local g_parts: { string } = { g.id, tostring(gfold) }
+		local counts = data.group_counts[g.id]
+		local g_parts: { string } = {
+			g.id,
+			tostring(gfold),
+			tostring(counts.total),
+			tostring(counts.running),
+			tostring(counts.idle),
+			tostring(persisted.badge_vis.total),
+			tostring(persisted.badge_vis.running),
+			tostring(persisted.badge_vis.idle),
+			tostring(persisted.badge_vis.hide_zero),
+		}
 		-- Dragging repaints from the drop handlers themselves; keeping the state here means a
 		-- background tick never leaves a stale pick marker behind.
 		if picked_skey ~= nil then
@@ -1003,6 +1208,7 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 				for _, t in ipairs(s.tabs) do
 					local tkey = tostring(t.id)
 					local tfold = persisted.fold_tabs[tkey] == true
+					local tmarked = persisted.marked_tabs[tkey] == true
 					table.insert(
 						g_parts,
 						table.concat({
@@ -1013,6 +1219,8 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 							tostring(t.busy),
 							t.status,
 							tostring(#t.panes),
+							t.icon,
+							tostring(tmarked),
 						}, ";")
 					)
 					if not tfold then
@@ -1028,6 +1236,7 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 									tostring(p.err),
 									p.status,
 									tostring(p.focused),
+									p.icon,
 								}, "/")
 							)
 						end
@@ -1087,9 +1296,10 @@ end
 
 local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 	local root_children: { Node } = {}
+	local picked_sess_entry = if picked_skey then data.by_skey[picked_skey] else nil
 	local dom_level1: { DomLevel1 } = {}
 	local dom_level2: { DomLevel2 } = {}
-	local dom_fp_parts: { string } = { persisted.side }
+	local dom_fp_parts: { string } = { persisted.side, tostring(badge_cfg_open) }
 	-- 1. Top Toolbar
 	local toolbar = ui.node("row", {
 		key = "toolbar",
@@ -1128,23 +1338,76 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 				title = "Refresh Kanban sidebar",
 				actions = { click = "refresh" },
 			}),
+			ui.button("", {
+				key = "btn_hide",
+				icon = "x",
+				size = "sm",
+				variant = "quiet",
+				title = "Ẩn sidebar (Ctrl+Alt+B)",
+				actions = { click = "hide_sidebar" },
+			}),
 		}),
 	})
 	table.insert(root_children, toolbar)
 
 
-	-- 3. Kanban Groups: TODO, Processing, DONE
+	-- 3. Kanban Groups: one column per stage
 	for _, g in ipairs(GROUPS) do
 		local g_entries = data.by_group[g.id] or {}
+		if stage_hidden(g, #g_entries) then
+			continue
+		end
 		local g_folded = persisted.fold_groups[g.id] == true
 		local g_chev = if g_folded then "▸" else "▾"
 		local group_children: { Node } = {}
+		table.insert(dom_fp_parts, "G:" .. g.id .. ":" .. tostring(g_folded) .. ":" .. tostring(#g_entries))
 
 		local is_group_drop_target = (picked_skey ~= nil and (hover_group == g.id or hover_group == nil))
 		local head_click = if picked_skey then ("drop_group=" .. g.id) else ("fold_group=" .. g.id)
-		local head_right_badge = if is_group_drop_target
-			then ui.badge("↓ Drop here", g.tone)
-			else ui.badge(tostring(#g_entries), g.tone)
+		local counts = data.group_counts[g.id]
+		local hide_zero = persisted.badge_vis.hide_zero == true
+		local head_right_children: { Node } = {}
+		if is_group_drop_target then
+			table.insert(head_right_children, ui.badge("↓ Drop here", g.tone))
+		else
+			if persisted.badge_vis.total ~= false and not (hide_zero and counts.total == 0) then
+				table.insert(
+					head_right_children,
+					ui.node("badge", {
+						key = "cnt_tot_" .. g.id,
+						role = "sidebar2.count.total",
+						text = tostring(counts.total),
+						tone = "info",
+						title = "Tổng số Agent: " .. tostring(counts.total),
+					})
+				)
+			end
+			if persisted.badge_vis.running ~= false and not (hide_zero and counts.running == 0) then
+				table.insert(
+					head_right_children,
+					ui.node("badge", {
+						key = "cnt_run_" .. g.id,
+						role = "sidebar2.count.running",
+						text = tostring(counts.running),
+						tone = "warning",
+						title = "Agent đang chạy: " .. tostring(counts.running),
+					})
+				)
+			end
+			if persisted.badge_vis.idle ~= false and not (hide_zero and counts.idle == 0) then
+				table.insert(
+					head_right_children,
+					ui.node("badge", {
+						key = "cnt_idl_" .. g.id,
+						role = "sidebar2.count.idle",
+						text = tostring(counts.idle),
+						tone = "success",
+						title = "Agent đang idle: " .. tostring(counts.idle),
+					})
+				)
+			end
+		end
+		table.insert(head_right_children, ui.text({ ui.span(g_chev, "muted") }))
 		local ghead_key = "ghead_" .. g.id
 		local group_head = ui.node("row", {
 			key = ghead_key,
@@ -1168,20 +1431,26 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 			ui.text({
 				ui.span(g.label, "strong " .. g.tone),
 			}),
-			ui.row({
-				head_right_badge,
-				ui.text({ ui.span(g_chev, "muted") }),
-			}),
+			ui.node("row", {
+				key = "ghead_right_" .. g.id,
+				role = "sidebar2.group_counts",
+				align = "center",
+			}, head_right_children),
 		})
 		table.insert(group_children, group_head)
 
 		if not g_folded then
 			if #g_entries == 0 then
+				local is_empty_drop = (picked_skey ~= nil and hover_group == g.id)
 				table.insert(
 					group_children,
 					ui.node("row", {
 						key = "empty_" .. g.id,
 						role = "sidebar2.empty",
+						mark = if is_empty_drop then "drop_target" else nil,
+						actions = if picked_skey ~= nil
+							then { click = "drop_sess=" .. g.id .. ":1" }
+							else nil,
 					}, {
 						ui.text({ ui.span("No sessions in " .. g.label, "muted") }),
 					})
@@ -1192,13 +1461,33 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					local s_chev = if s_folded then "▸" else "▾"
 					local is_picked = (picked_skey == sess.skey)
 					local can_reorder_sess = #g_entries >= 2
+					local is_same_group_drag = (
+						picked_sess_entry ~= nil and picked_sess_entry.group == g.id
+					)
+					-- Moving into another group can append past the last row (`N + 1`), which no row
+					-- of its own represents; the last row carries that mark instead.
+					local is_append_after_last = (
+						not is_same_group_drag
+						and picked_skey ~= nil
+						and hover_group == g.id
+						and hover_sess_pos ~= nil
+						and hover_sess_pos > #g_entries
+						and sess.pos == #g_entries
+					)
 					local is_sess_drop_target = (
 						picked_skey ~= nil
 						and picked_skey ~= sess.skey
 						and (hover_group == nil or hover_group == g.id)
-						and (hover_sess_pos == nil or hover_sess_pos == sess.pos)
+						and (hover_sess_pos == nil or hover_sess_pos == sess.pos or is_append_after_last)
 					)
-					local drop_sess_act = "drop_sess=" .. g.id .. ":" .. tostring(sess.pos)
+					local effective_drop_pos = if is_append_after_last then (#g_entries + 1) else sess.pos
+					local drop_sess_act = "drop_sess=" .. g.id .. ":" .. tostring(effective_drop_pos)
+					local sess_drop_mark = if not is_sess_drop_target or hover_group ~= g.id or hover_sess_pos == nil
+						then nil
+						elseif is_append_after_last
+							or (is_same_group_drag and picked_sess_entry and sess.pos > picked_sess_entry.pos)
+							then "drop_after"
+						else "drop_before"
 					local l1_role = if sess.current then "sidebar2.level1.current" else "sidebar2.level1"
 					local host_badge_tone = if sess.host_kind == "remote" then "info" else "neutral"
 					local sess_st_node = status_icon_node("st_s_" .. sess.skey, sess.status)
@@ -1206,39 +1495,28 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					local l1_menu: { any } = {
 						{ header = sess.host_name .. " · " .. sess.name },
 						{ id = "new_tab_in=" .. tostring(sess.id), label = "New Tab", icon = "plus" },
+						{ id = "new_omp_in=" .. tostring(sess.id), label = "New Tab omp", icon = "open" },
 						"-",
 						{ id = "focus_sess=" .. tostring(sess.id), label = "Focus Session", icon = "open" },
 						{ id = "rename_sess=" .. tostring(sess.id), label = "Rename Session…", icon = "pen" },
 						"-",
 						{ header = "Kanban Stage" },
-						{
-							id = "move_todo=" .. sess.skey,
-							label = "Move to TODO",
-							icon = "inbox",
-							radio = "stage",
-							checked = (sess.group == "todo"),
-						},
-						{
-							id = "move_doing=" .. sess.skey,
-							label = "Move to PROCESSING",
-							icon = "activity",
-							radio = "stage",
-							checked = (sess.group == "doing"),
-						},
-						{
-							id = "move_done=" .. sess.skey,
-							label = "Move to DONE",
-							icon = "check",
-							radio = "stage",
-							checked = (sess.group == "done"),
-						},
-						"-",
-						{
-							id = "pick=" .. sess.skey,
-							label = if is_picked then "Cancel Pick Session" else "Pick Session",
-							icon = "grip",
-						},
 					}
+					for _, gspec in ipairs(GROUPS) do
+						table.insert(l1_menu, {
+							id = "move_group=" .. gspec.id .. ":" .. sess.skey,
+							label = "Move to " .. gspec.label,
+							icon = gspec.icon,
+							radio = "stage",
+							checked = (sess.group == gspec.id),
+						})
+					end
+					table.insert(l1_menu, "-")
+					table.insert(l1_menu, {
+						id = "pick=" .. sess.skey,
+						label = if is_picked then "Cancel Pick Session" else "Pick Session",
+						icon = "grip",
+					})
 					if can_reorder_sess then
 						if sess.pos > 1 then
 							table.insert(l1_menu, {
@@ -1268,7 +1546,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					local l1_right_badge = if is_sess_drop_target
 						then ui.node("badge", {
 							key = "drop_s_" .. sess.skey,
-							text = "↕ #" .. tostring(sess.pos),
+							text = "↕ #" .. tostring(effective_drop_pos),
 							tone = "info",
 							actions = { click = drop_sess_act },
 						})
@@ -1289,7 +1567,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					local l1_row = ui.node("row", {
 						key = "l1_" .. sess.skey,
 						role = l1_role,
-						mark = if is_picked then "pick" else nil,
+						mark = if is_picked then "pick" else sess_drop_mark,
 						justify = "between",
 						align = "center",
 					}, {
@@ -1345,6 +1623,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 							local tkey = tostring(tab.id)
 							local has_sub = #tab.panes >= 2
 							local t_folded = persisted.fold_tabs[tkey] == true
+							local t_marked = persisted.marked_tabs[tkey] == true
 							local t_chev = if t_folded then "▸" else "▾"
 							local is_tab_picked = (picked_tab_id == tab.id)
 							local is_tab_drop_target = (
@@ -1353,6 +1632,20 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 								and picked_tab_id ~= tab.id
 								and (hover_tab_pos == nil or hover_tab_pos == tab.pos)
 							)
+							local picked_tab_pos: number? = nil
+							if picked_tab_sess == sess.id then
+								for _, pt in ipairs(sess.tabs) do
+									if pt.id == picked_tab_id then
+										picked_tab_pos = pt.pos
+										break
+									end
+								end
+							end
+							local tab_drop_mark = if not is_tab_drop_target or hover_tab_pos == nil
+								then nil
+								elseif picked_tab_pos and tab.pos > picked_tab_pos
+									then "drop_after"
+								else "drop_before"
 							local l2_role = if tab.current then "sidebar2.level2.current" else "sidebar2.level2"
 							local tab_st_node = status_icon_node("st_t_" .. tkey, tab.status)
 							local focus_tab_act = "focus_tab=" .. tostring(sess.id) .. ":" .. tkey
@@ -1368,16 +1661,33 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 								tab_count = #sess.tabs,
 								has_sub = has_sub,
 							})
-							table.insert(dom_fp_parts, "L2:" .. tkey .. ":" .. tostring(tab.pos) .. ":" .. tostring(t_folded))
+							table.insert(
+								dom_fp_parts,
+								"L2:"
+									.. tkey
+									.. ":"
+									.. tostring(tab.pos)
+									.. ":"
+									.. tostring(t_folded)
+									.. ":"
+									.. tostring(if has_sub and not t_folded then #tab.panes else 0)
+							)
 
 							local l2_menu: { any } = {
 								{ header = "#" .. tostring(tab.pos) .. " " .. tab.title },
-								{ id = "new_tab_in=" .. tostring(sess.id), label = "New Tab", icon = "plus" },
+								{ id = "new_tab_in=" .. tostring(sess.id) .. ":" .. tkey, label = "New Tab", icon = "plus" },
+								{ id = "new_omp_in=" .. tostring(sess.id) .. ":" .. tkey, label = "New Tab omp", icon = "open" },
 								{
 									id = "close_tab=" .. tostring(sess.id) .. ":" .. tkey,
 									label = "Close Tab",
 									icon = "trash",
 									danger = true,
+								},
+								"-",
+								{
+									id = "mark_tab=" .. tkey,
+									label = if t_marked then "Bỏ đánh dấu" else "Đánh dấu cần đọc",
+									icon = if t_marked then "check" else "eye",
 								},
 								"-",
 								{
@@ -1435,6 +1745,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 									key = "title_t_" .. tkey,
 									role = "sidebar2.l2_title",
 									align = "center",
+									gap = "xs",
 									title = "#"
 										.. tostring(tab.pos)
 										.. " "
@@ -1444,6 +1755,13 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 										.. " panes)",
 									actions = { click = primary_tab_act, menu = l2_menu },
 								}, {
+									ui.node("icon", {
+										name = tab.icon,
+										tone = if tab.current
+											then "accent"
+											elseif tab.has_agent then "info"
+											else "neutral",
+									}),
 									ui.text({
 										ui.span("#" .. tostring(tab.pos) .. " ", "muted"),
 										ui.span(
@@ -1458,6 +1776,19 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 							)
 
 							local l2_right_items: { Node } = {}
+							if t_marked then
+								table.insert(
+									l2_right_items,
+									ui.node("badge", {
+										key = "mark_t_" .. tkey,
+										role = "sidebar2.tab_mark",
+										text = "⚑",
+										tone = "error",
+										title = "Tab cần đọc (Click hoặc chuột phải để bỏ đánh dấu)",
+										actions = { click = "mark_tab=" .. tkey, menu = l2_menu },
+									})
+								)
+							end
 							if tab_st_node then
 								table.insert(l2_right_items, tab_st_node)
 							end
@@ -1496,7 +1827,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 							local l2_row = ui.node("row", {
 								key = "l2_" .. tkey,
 								role = l2_role,
-								mark = if is_tab_picked then "pick" else nil,
+								mark = if is_tab_picked then "pick" else tab_drop_mark,
 								justify = "between",
 								align = "center",
 							}, l2_children)
@@ -1531,7 +1862,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 											grow = 1,
 										}, {
 											ui.node("icon", {
-												name = pane_icon(pane.kind),
+												name = pane.icon,
 												tone = if pane.err
 													then "error"
 													elseif pane.focused then "accent"
@@ -1609,29 +1940,169 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 		role = "sidebar2.root",
 	}, root_children)
 
-	local dock = ui.node("row", {
+	local badge_cfg_menu: { any } = {
+		{ header = "Hiển thị số lượng Agent" },
+		{
+			id = "toggle_badge=total",
+			label = "Tổng số Agent (Total)",
+			checked = (persisted.badge_vis.total ~= false),
+		},
+		{
+			id = "toggle_badge=running",
+			label = "Agent đang chạy (Running)",
+			checked = (persisted.badge_vis.running ~= false),
+		},
+		{
+			id = "toggle_badge=idle",
+			label = "Agent đang idle (Idle)",
+			checked = (persisted.badge_vis.idle ~= false),
+		},
+		"-",
+		{
+			id = "toggle_badge=hide_zero",
+			label = "Ẩn badge khi số lượng = 0",
+			checked = persisted.badge_vis.hide_zero,
+		},
+	}
+
+	local dock_rows: { Node } = {}
+	if badge_cfg_open then
+		table.insert(
+			dock_rows,
+			ui.node("row", {
+				key = "dock_badge_bar",
+				role = "sidebar2.dock_filter",
+				justify = "between",
+				align = "center",
+			}, {
+				ui.node("badge", {
+					key = "flt_total",
+					role = if persisted.badge_vis.total then "sidebar2.count.total" else "sidebar2.count.off",
+					text = (if persisted.badge_vis.total then "✓ " else "○ ") .. "Tổng",
+					tone = if persisted.badge_vis.total then "info" else "neutral",
+					title = "Ẩn/hiện Tổng số Agent",
+					actions = { click = "toggle_badge=total" },
+				}),
+				ui.node("badge", {
+					key = "flt_running",
+					role = if persisted.badge_vis.running then "sidebar2.count.running" else "sidebar2.count.off",
+					text = (if persisted.badge_vis.running then "✓ " else "○ ") .. "Chạy",
+					tone = if persisted.badge_vis.running then "warning" else "neutral",
+					title = "Ẩn/hiện Agent đang chạy",
+					actions = { click = "toggle_badge=running" },
+				}),
+				ui.node("badge", {
+					key = "flt_idle",
+					role = if persisted.badge_vis.idle then "sidebar2.count.idle" else "sidebar2.count.off",
+					text = (if persisted.badge_vis.idle then "✓ " else "○ ") .. "Idle",
+					tone = if persisted.badge_vis.idle then "success" else "neutral",
+					title = "Ẩn/hiện Agent đang idle",
+					actions = { click = "toggle_badge=idle" },
+				}),
+				ui.node("badge", {
+					key = "flt_zero",
+					role = if persisted.badge_vis.hide_zero then "sidebar2.count.zero" else "sidebar2.count.off",
+					text = (if persisted.badge_vis.hide_zero then "✓ " else "○ ") .. "Ẩn 0",
+					tone = if persisted.badge_vis.hide_zero then "info" else "neutral",
+					title = "Ẩn/hiện badge có số lượng = 0",
+					actions = { click = "toggle_badge=hide_zero" },
+				}),
+			})
+		)
+	end
+	if stage_cfg_open then
+		local stage_row: { Node } = {}
+		local row_n = 0
+		local function flush_stage_row()
+			if #stage_row > 0 then
+				row_n += 1
+				table.insert(
+					dock_rows,
+					ui.node("row", {
+						key = "dock_stage_bar_" .. tostring(row_n),
+						role = "sidebar2.dock_filter",
+						justify = "between",
+						align = "center",
+					}, stage_row)
+				)
+				stage_row = {}
+			end
+		end
+		for _, g in ipairs(GROUPS) do
+			local on = persisted.stage_vis[g.id] ~= false
+			table.insert(stage_row, ui.node("badge", {
+				key = "stage_vis_" .. g.id,
+				role = if on then "sidebar2.stage.on" else "sidebar2.stage.off",
+				text = (if on then "✓ " else "○ ") .. g.label,
+				tone = if on then g.tone else "neutral",
+				title = "Ẩn/hiện trạng thái " .. g.label,
+				actions = { click = "toggle_stage=" .. g.id },
+			}))
+			if #stage_row == 2 then
+				flush_stage_row()
+			end
+		end
+		local he_on = persisted.hide_empty
+		table.insert(stage_row, ui.node("badge", {
+			key = "stage_hide_empty",
+			role = if he_on then "sidebar2.stage.on" else "sidebar2.stage.off",
+			text = (if he_on then "✓ " else "○ ") .. "Ẩn trống",
+			tone = if he_on then "info" else "neutral",
+			title = "Ẩn trạng thái không có session",
+			actions = { click = "toggle_hide_empty" },
+		}))
+		flush_stage_row()
+	end
+	table.insert(
+		dock_rows,
+		ui.node("row", {
+			key = "dock_main_row",
+			justify = "between",
+			align = "center",
+		}, {
+			ui.button("Session", {
+				key = "dock_new_sess",
+				icon = "plus",
+				size = "sm",
+				variant = "default",
+				title = "Create new session",
+				actions = { click = "new_session" },
+			}),
+			ui.row({
+				ui.button("Move…", {
+					key = "dock_move_sess",
+					icon = "swap",
+					size = "sm",
+					variant = "quiet",
+					title = "Move session to another stage",
+					actions = { click = "move_modal" },
+				}),
+				ui.button("", {
+					key = "dock_stage_cfg",
+					icon = "kanban",
+					size = "sm",
+					variant = if stage_cfg_open then "default" else "quiet",
+					title = "Tùy chỉnh hiển thị trạng thái",
+					actions = { click = "toggle_stage_cfg" },
+				}),
+				ui.button("", {
+					key = "dock_badge_cfg",
+					icon = "sliders",
+					size = "sm",
+					variant = if badge_cfg_open then "default" else "quiet",
+					title = "Tùy chỉnh hiển thị tổng số Agent (Click hoặc Chuột phải)",
+					actions = {
+						click = "toggle_badge_cfg",
+						menu = badge_cfg_menu,
+					},
+				}),
+			}),
+		})
+	)
+	local dock = ui.node("col", {
 		key = "sidebar2_dock",
 		role = "sidebar2.dock",
-		justify = "between",
-		align = "center",
-	}, {
-		ui.button("Session", {
-			key = "dock_new_sess",
-			icon = "plus",
-			size = "sm",
-			variant = "default",
-			title = "Create new session",
-			actions = { click = "new_session" },
-		}),
-		ui.button("Move…", {
-			key = "dock_move_sess",
-			icon = "swap",
-			size = "sm",
-			variant = "quiet",
-			title = "Move session to TODO / Processing / DONE",
-			actions = { click = "move_modal" },
-		}),
-	})
+	}, dock_rows)
 
 	return view, dock, sections
 end
@@ -1808,24 +2279,31 @@ end
 
 local function match_ratio(cx: WindowCx, spane: number, tab_id: number, side: "left" | "right", target_ratio: number)
 	local resize_dir: Dir = if side == "left" then "right" else "left"
-	for step = 1, 5 do
+	-- Share one column of this tab moves: resize works in whole cells, so half of one is the closest
+	-- to the target any tab can land. The first step uses the estimate, the next measures the tab's
+	-- own column count and lands every session on the same width.
+	local per_cell: number? = nil
+	for _ = 1, 5 do
 		local ok, lay = pcall(function()
 			return cx.session:layout(tab_id)
 		end)
 		if not ok or not lay then
-			break
+			return
 		end
 		local at_edge, cur_share = is_sidebar_at_root_edge(lay, spane, side)
 		if not at_edge or not cur_share then
-			break
+			return
 		end
 		local diff = target_ratio - cur_share
-		if math.abs(diff) <= 0.012 then
-			synced_tab_ratio[tab_id] = cur_share
-			break
+		local unit = per_cell or (1 / persisted.cols_est)
+		if math.abs(diff) <= unit * 0.5 then
+			if per_cell then
+				persisted.cols_est = 1 / per_cell
+				save_state()
+			end
+			return
 		end
-		local cols = persisted.cols_est
-		local cells = math.floor(diff * cols + (if diff >= 0 then 0.5 else -0.5))
+		local cells = math.floor(diff / unit + (if diff >= 0 then 0.5 else -0.5))
 		if cells == 0 then
 			cells = if diff > 0 then 1 else -1
 		end
@@ -1833,24 +2311,24 @@ local function match_ratio(cx: WindowCx, spane: number, tab_id: number, side: "l
 			return cx.layout:resize(spane, resize_dir, cells)
 		end)
 		if not moved_ok or not moved then
-			synced_tab_ratio[tab_id] = cur_share
-			break
+			return
 		end
 		local ok2, lay2 = pcall(function()
 			return cx.session:layout(tab_id)
 		end)
-		if ok2 and lay2 then
-			local ok_edge2, new_share = is_sidebar_at_root_edge(lay2, spane, side)
-			if ok_edge2 and new_share then
-				local actual_delta = new_share - cur_share
-				if math.abs(actual_delta) > 0.005 then
-					persisted.cols_est = clamp(math.abs(cells / actual_delta), 60, 600)
-					save_state()
-				end
-				synced_tab_ratio[tab_id] = new_share
-				if math.abs(target_ratio - new_share) <= 0.012 then
-					break
-				end
+		if not ok2 or not lay2 then
+			return
+		end
+		local ok_edge2, new_share = is_sidebar_at_root_edge(lay2, spane, side)
+		if not ok_edge2 or not new_share then
+			return
+		end
+		local actual_delta = new_share - cur_share
+		-- One-cell steps read back rounded, so only a multi-cell move measures the tab.
+		if math.abs(cells) >= 3 and math.abs(actual_delta) > 1e-6 then
+			local measured = math.abs(actual_delta / cells)
+			if measured > 1 / 1200 and measured < 1 / 30 then
+				per_cell = measured
 			end
 		end
 	end
@@ -1959,10 +2437,25 @@ place_sidebar_at_edge = function(
 	if not at_edge or not cur_share then
 		return moved_tabs
 	end
-	if math.abs(cur_share - target_ratio) > 0.015 then
-		match_ratio(cx, spane, tab_id, side, target_ratio)
-	else
-		synced_tab_ratio[tab_id] = cur_share
+	local prev = synced_tab_ratio[tab_id]
+	if not moved_tabs and prev and math.abs(cur_share - prev) > 0.5 / persisted.cols_est then
+		-- The divider was dragged by hand: that width is the one every session keeps, not drift to
+		-- correct back to the default.
+		persisted.ratio = clamp(cur_share, MIN_SIDEBAR_RATIO, MAX_SIDEBAR_RATIO)
+		save_state()
+		target_ratio = persisted.ratio
+	end
+	match_ratio(cx, spane, tab_id, side, target_ratio)
+	-- Remember where a settled strip sits: a hand drag then accumulates against it until it passes
+	-- the deadband, instead of each small step being re-seeded and never adopted.
+	local ok_f, lay_f = pcall(function()
+		return cx.session:layout(tab_id)
+	end)
+	if ok_f and lay_f then
+		local ok_f2, share_f = is_sidebar_at_root_edge(lay_f, spane, side)
+		if ok_f2 and share_f and math.abs(share_f - persisted.ratio) <= 0.5 / persisted.cols_est then
+			synced_tab_ratio[tab_id] = share_f
+		end
 	end
 	return moved_tabs
 end
@@ -1994,21 +2487,32 @@ end
 -- ---------------------------------------------------------------------------
 local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 	if busy_lock then
+		render_pending = true
 		return
 	end
 	busy_lock = true
+	-- A hover frame only redraws the changed columns: moving the pane, refocusing the terminal
+	-- and refreshing Chrome on every 30ms drag frame is what made dragging feel laggy.
+	local drag_fast = last_drag_active and not force_paint and active_sidebar_pane ~= nil
 
 	local ok, err = pcall(function()
-		ensure_status_bar(cx)
+		if not drag_fast then
+			ensure_status_bar(cx)
+		end
 
 		if not persisted.visible then
 			close_all_sidebars(cx)
 			return
 		end
-		ensure_drag_helper()
+		if not drag_fast then
+			ensure_drag_helper()
+		end
 		-- A session with no tabs shows Tern's "No Terminals open" and has nothing to hold the
 		-- sidebar: hand the window to a session that still has tabs.
 		pcall(function()
+			if drag_fast then
+				return
+			end
 			local ok_t, tlist = pcall(function()
 				return cx.session:tabs()
 			end)
@@ -2172,8 +2676,10 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				drop_sidebar_pane(cx, spane)
 				return
 			end
-			local moved_tabs = place_sidebar_at_edge(cx, spane, tab_id, persisted.side, persisted.ratio)
-			if moved_tabs or not last_drag_active then
+			local moved_tabs = if drag_fast
+				then false
+				else place_sidebar_at_edge(cx, spane, tab_id, persisted.side, persisted.ratio)
+			if not drag_fast and (moved_tabs or not last_drag_active) then
 				refocus_terminal(cx, tab_id, data.owned)
 			end
 			if force_paint or painted_fp[spane] ~= fp or needs_hydration(cx, spane) then
@@ -2183,8 +2689,9 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				if not force_paint and not needs_hydration(cx, spane) and painted_fp[spane] ~= nil and prev ~= nil then
 					local patch: { [string]: Node | false } = {}
 					for _, k in ipairs(SECTION_KEYS) do
-						if prev[k] ~= sec_fp[k] and sections[k] ~= nil then
-							patch[k] = sections[k]
+						if prev[k] ~= sec_fp[k] then
+							-- A hidden stage has no section: false drops the column it left mounted.
+							patch[k] = sections[k] or false
 						end
 					end
 					if next(patch) == nil then
@@ -2268,7 +2775,13 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 	if not ok then
 		tern.log.warn("sidebar2 sync error:", tostring(err))
 	end
-	pcall(tern.chrome.refresh)
+	if not drag_fast then
+		pcall(tern.chrome.refresh)
+	end
+	if render_pending then
+		render_pending = false
+		sync_and_render(cx, force_paint)
+	end
 end
 
 -- Close one tab without letting the sidebar ride along: it moves to the nearest sibling tab of
@@ -2340,6 +2853,9 @@ local function close_tab_safely(cx: WindowCx, tid: number, hint_sess_id: number?
 	end
 	synced_tab_ratio[tid] = nil
 	last_user_pane_by_tab[tid] = nil
+	persisted.marked_tabs[tostring(tid)] = nil
+	persisted.fold_tabs[tostring(tid)] = nil
+	save_state()
 	sync_and_render(cx, true)
 end
 
@@ -2453,7 +2969,7 @@ local function open_move_modal(cx: WindowCx)
 		return
 	end
 	cx:pick({
-		placeholder = "Move Host / Session to TODO, Processing, or DONE…",
+		placeholder = "Move Host / Session to another stage…",
 		icon = "kanban",
 		action = "move",
 		items = items,
@@ -2462,6 +2978,75 @@ local function open_move_modal(cx: WindowCx)
 			set_session_group(pick_cx, choice.skey, choice.target_group :: GroupId, true)
 		end
 	end)
+end
+
+-- "Start in" for a new tab: the tab's own folder when one is given, else the folder the session's
+-- shells use most; ties go to the most recently focused pane, i.e. the session's last folder.
+local function new_tab_cwd(cx: WindowCx, sess_id: number?, tab_id: number?): string?
+	local ok_p, plist = pcall(function()
+		return cx.session:panes()
+	end)
+	if not ok_p or type(plist) ~= "table" then
+		return nil
+	end
+	local function shell_cwd(p: PaneInfo): string?
+		local k = p.kind
+		if k ~= nil and k ~= "terminal" and k ~= "agent" then
+			return nil
+		end
+		return if type(p.cwd) == "string" and p.cwd ~= "" then p.cwd else nil
+	end
+	if tab_id then
+		local best, best_rank = nil, -2
+		for _, p in ipairs(plist) do
+			local c = shell_cwd(p)
+			if c and p.tab == tab_id then
+				local rank = if p.focused then math.huge else (focus_rank[p.pane] or -1)
+				if rank > best_rank then
+					best, best_rank = c, rank
+				end
+			end
+		end
+		return best
+	end
+	local ok_t, tlist = pcall(function()
+		return cx.session:tabs()
+	end)
+	local in_sess: { [number]: boolean } = {}
+	if ok_t and type(tlist) == "table" then
+		for _, t in ipairs(tlist) do
+			if sess_id == nil or t.session == sess_id then
+				in_sess[t.id] = true
+			end
+		end
+	end
+	local tally: { [string]: { n: number, rank: number } } = {}
+	for _, p in ipairs(plist) do
+		local c = shell_cwd(p)
+		if c and p.tab ~= nil and in_sess[p.tab] then
+			local t = tally[c]
+			if not t then
+				t = { n = 0, rank = -1 }
+				tally[c] = t
+			end
+			t.n = t.n + 1
+			local r = focus_rank[p.pane] or -1
+			if r > t.rank then
+				t.rank = r
+			end
+		end
+	end
+	local best_c, best_t = nil, nil
+	for c, t in pairs(tally) do
+		if
+			best_t == nil
+			or t.n > best_t.n
+			or (t.n == best_t.n and (t.rank > best_t.rank or (t.rank == best_t.rank and c < best_c)))
+		then
+			best_c, best_t = c, t
+		end
+	end
+	return best_c
 end
 
 -- ---------------------------------------------------------------------------
@@ -2533,6 +3118,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		return nil
 	end
 	local cmd, val = parse_action(ev)
+	-- Releasing the mouse fires a click a few ms after the drop, on whatever row it landed on;
+	-- folding or focusing there would undo the drag the user just made.
+	local drag_guard = last_drag_active or (tern.now() - last_drag_end_ms) < 250
 
 	if cmd == "hide_sidebar" then
 		set_sidebar_visible(cx, false)
@@ -2542,6 +3130,34 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		return true
 	elseif cmd == "refresh" then
 		sync_and_render(cx, true)
+		return true
+	elseif cmd == "toggle_badge_cfg" then
+		badge_cfg_open = not badge_cfg_open
+		sync_and_render(cx, true)
+		return true
+	elseif cmd == "toggle_stage_cfg" then
+		stage_cfg_open = not stage_cfg_open
+		sync_and_render(cx, true)
+		return true
+	elseif cmd == "toggle_stage" then
+		if GROUP_BY_ID[val] then
+			persisted.stage_vis[val] = not (persisted.stage_vis[val] ~= false)
+			save_state()
+			sync_and_render(cx, true)
+		end
+		return true
+	elseif cmd == "toggle_hide_empty" then
+		persisted.hide_empty = not persisted.hide_empty
+		save_state()
+		sync_and_render(cx, true)
+		return true
+	elseif cmd == "toggle_badge" then
+		if val == "total" or val == "running" or val == "idle" or val == "hide_zero" then
+			local k = val :: BadgeKey
+			persisted.badge_vis[k] = not (persisted.badge_vis[k] ~= false)
+			save_state()
+			sync_and_render(cx, true)
+		end
 		return true
 	elseif cmd == "fold_all" then
 		local data = collect_data(cx)
@@ -2559,6 +3175,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		sync_and_render(cx, true)
 		return true
 	elseif cmd == "fold_group" then
+		if drag_guard then
+			return true
+		end
 		if GROUP_BY_ID[val] then
 			persisted.fold_groups[val :: GroupId] = not (persisted.fold_groups[val] == true)
 			save_state()
@@ -2566,6 +3185,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		end
 		return true
 	elseif cmd == "fold_sess" then
+		if drag_guard then
+			return true
+		end
 		if val ~= "" then
 			persisted.fold_sessions[val] = not (persisted.fold_sessions[val] == true)
 			save_state()
@@ -2573,8 +3195,25 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		end
 		return true
 	elseif cmd == "fold_tab" then
+		if drag_guard then
+			return true
+		end
 		if val ~= "" then
 			persisted.fold_tabs[val] = not (persisted.fold_tabs[val] == true)
+			save_state()
+			sync_and_render(cx, true)
+		end
+		return true
+	elseif cmd == "mark_tab" then
+		if drag_guard then
+			return true
+		end
+		if val ~= "" then
+			if persisted.marked_tabs[val] then
+				persisted.marked_tabs[val] = nil
+			else
+				persisted.marked_tabs[val] = true
+			end
 			save_state()
 			sync_and_render(cx, true)
 		end
@@ -2657,7 +3296,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		return true
 	elseif cmd == "drop_group" then
 		if picked_skey and GROUP_BY_ID[val] then
-			set_session_group(cx, picked_skey, val :: GroupId, true, nil)
+			-- A head drop means "put it first"; nil would append at the end of the group.
+			local head_pos = if hover_group == val and hover_sess_pos then hover_sess_pos else 1
+			set_session_group(cx, picked_skey, val :: GroupId, true, head_pos)
 		end
 		return true
 	elseif cmd == "drop_sess" then
@@ -2677,31 +3318,28 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	elseif cmd == "cycle_group" then
 		cycle_session_group(cx, val)
 		return true
-	elseif cmd == "move_todo" then
-		if val ~= "" then
-			set_session_group(cx, val, "todo", true)
-		end
-		return true
-	elseif cmd == "move_doing" then
-		if val ~= "" then
-			set_session_group(cx, val, "doing", true)
-		end
-		return true
-	elseif cmd == "move_done" then
-		if val ~= "" then
-			set_session_group(cx, val, "done", true)
+	elseif cmd == "move_group" then
+		local gid, skey = string.match(val, "^(%a+):(.+)$")
+		if gid and skey and GROUP_BY_ID[gid] then
+			set_session_group(cx, skey, gid :: GroupId, true)
 		end
 		return true
 	elseif cmd == "move_modal" then
 		open_move_modal(cx)
 		return true
 	elseif cmd == "focus_sess" then
+		if drag_guard then
+			return true
+		end
 		local sid = tonumber(val)
 		if sid then
 			focus_session_tab_pane(cx, sid, nil, nil)
 		end
 		return true
 	elseif cmd == "focus_tab" then
+		if drag_guard then
+			return true
+		end
 		local s_str, t_str = string.match(val, "^(%d+):(%d+)$")
 		local sid = tonumber(s_str)
 		local tid = tonumber(t_str)
@@ -2710,6 +3348,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		end
 		return true
 	elseif cmd == "focus_pane" then
+		if drag_guard then
+			return true
+		end
 		local s_str, t_str, p_str = string.match(val, "^(%d+):(%d+):(%d+)$")
 		local sid = tonumber(s_str)
 		local tid = tonumber(t_str)
@@ -2751,13 +3392,17 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		end)
 		return true
 	elseif cmd == "new_tab" then
+		local cwd = new_tab_cwd(cx, nil, nil)
 		pcall(function()
-			cx.layout:new_tab(nil, { focus = true })
+			cx.layout:new_tab(if cwd then { cwd = cwd } else nil, { focus = true })
 		end)
 		sync_and_render(cx, true)
 		return true
 	elseif cmd == "new_tab_in" then
-		local sid = tonumber(val)
+		local s_str, t_str = string.match(val, "^(%d+):(%d+)$")
+		local sid = tonumber(s_str) or tonumber(val)
+		local tid = tonumber(t_str)
+		local cwd = new_tab_cwd(cx, sid, tid)
 		pcall(function()
 			local ok_cs, cur = pcall(function()
 				return cx.sessions:current()
@@ -2765,7 +3410,23 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 			if sid and (not ok_cs or not cur or cur.id ~= sid) then
 				cx.sessions:switch(sid)
 			end
-			cx.layout:new_tab(nil, { focus = true })
+			cx.layout:new_tab(if cwd then { cwd = cwd } else nil, { focus = true })
+		end)
+		sync_and_render(cx, true)
+		return true
+	elseif cmd == "new_omp_in" then
+		local s_str, t_str = string.match(val, "^(%d+):(%d+)$")
+		local sid = tonumber(s_str) or tonumber(val)
+		local tid = tonumber(t_str)
+		local cwd = new_tab_cwd(cx, sid, tid)
+		pcall(function()
+			local ok_cs, cur = pcall(function()
+				return cx.sessions:current()
+			end)
+			if sid and (not ok_cs or not cur or cur.id ~= sid) then
+				cx.sessions:switch(sid)
+			end
+			cx.layout:new_tab({ command = "omp", cwd = cwd }, { focus = true })
 		end)
 		sync_and_render(cx, true)
 		return true
@@ -2915,7 +3576,7 @@ tern.command({
 
 tern.command({
 	id = "move_session",
-	title = "Kanban Sidebar: Move Session to TODO / Processing / DONE…",
+	title = "Kanban Sidebar: Move Session to another stage…",
 	icon = "kanban",
 	run = function(cx: WindowCx)
 		open_move_modal(cx)
@@ -2945,7 +3606,7 @@ local function poll_drag_ipc(cx: WindowCx)
 		picked_tab_id = nil
 		picked_tab_sess = nil
 		hover_tab_pos = nil
-		pcall(tern.kv.set, "drag_state", { active = false })
+		-- drag_helper writes drag_state.active = false together with drag_drop.
 		if dd.kind == "session" and type(dd.skey) == "string" and type(dd.target_group) == "string" then
 			local tpos = if type(dd.target_pos) == "number" then dd.target_pos else nil
 			set_session_group(cx, dd.skey, dd.target_group :: GroupId, true, tpos)
@@ -2994,7 +3655,7 @@ local function poll_drag_ipc(cx: WindowCx)
 			picked_tab_id = new_tid
 			picked_tab_sess = new_tsess
 			hover_tab_pos = new_hpos
-			sync_and_render(cx, true)
+			sync_and_render(cx, false)
 		end
 	elseif last_drag_active then
 		last_drag_active = false
@@ -3029,7 +3690,7 @@ local function drag_step(cx: WindowCx?)
 		return
 	end
 	-- Reschedule first: a failing poll must never end the watch loop.
-	drag_timer = tern.timer(80, drag_step)
+	drag_timer = tern.timer(30, drag_step)
 	if cx then
 		local ok, err = pcall(poll_drag_ipc, cx)
 		if not ok then
@@ -3110,7 +3771,7 @@ function start_watcher()
 		return
 	end
 	if not drag_timer then
-		drag_timer = tern.timer(80, drag_step)
+		drag_timer = tern.timer(30, drag_step)
 	end
 	watch_timer = tern.timer(1000, step)
 end
@@ -3137,6 +3798,8 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	end
 	pane_notif[ev.pane] = nil
 	ack_alerts[ev.pane] = true
+	focus_rank_seq = focus_rank_seq + 1
+	focus_rank[ev.pane] = focus_rank_seq
 	local owned = owned_canvases(cx)
 	if not owned[ev.pane] then
 		last_user_pane_by_tab[ev.tab] = ev.pane
@@ -3204,6 +3867,7 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 			painted_fp[pid] = nil
 			painted_sec_fp[pid] = nil
 			opened_at_ms[pid] = nil
+			focus_rank[pid] = nil
 			save_state()
 		end
 	end

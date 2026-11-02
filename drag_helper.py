@@ -20,6 +20,7 @@ VK_LBUTTON = 0x01
 GA_ROOT = 2
 DRAG_THRESHOLD_PX = 5.0
 GRIP_WIDTH_PX = 34.0
+RIGHT_ICON_RESERVE_PX = 32.0
 GROUP_IDS = ("todo", "doing", "done")
 
 
@@ -30,7 +31,8 @@ def resolve_tern_env(kv: dict | None = None) -> tuple[str, dict]:
         env["TERN_PANE_SOCKET"] = r"\\.\pipe\tern-" + user
     if kv:
         ap = (kv.get("dom_map") or {}).get("active_pane")
-        if ap and not env.get("TERN_PANE"):
+        if ap:
+            # The worker outlives the pane that spawned it; the inherited value goes stale.
             env["TERN_PANE"] = str(ap)
     tern_bin = env.get("TERN_EXE") or os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tern\tern.com")
     if not tern_bin or not os.path.exists(tern_bin):
@@ -41,7 +43,7 @@ def resolve_tern_env(kv: dict | None = None) -> tuple[str, dict]:
 def load_kv(kv_path: str) -> dict:
     for _ in range(5):
         try:
-            with open(kv_path, "r", encoding="utf-8") as f:
+            with open(kv_path, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
                 return data if isinstance(data, dict) else {}
         except FileNotFoundError:
@@ -134,6 +136,12 @@ def snapshot_geometry(kv_path: str) -> dict:
         if idx < len(g_rects):
             groups.append({"id": gid, "rect": g_rects[idx]})
 
+    # A missed `ctl tree` call returns partial rects; caching that would shift every slot.
+    if l1_meta and len(l1_rects) != len(l1_meta):
+        return {"valid": False, "reason": "count_mismatch"}
+    if l2_meta and len(l2_rects) != len(l2_meta):
+        return {"valid": False, "reason": "count_mismatch"}
+
     level1 = []
     for idx in range(min(len(l1_rects), len(l1_meta))):
         item = dict(l1_meta[idx])
@@ -175,7 +183,7 @@ def hit_test_start(snap: dict, vx: float, vy: float) -> dict | None:
 
     for item in snap["level1"]:
         rx, ry, rw, rh = item["rect"]
-        if rx <= vx <= (rx + GRIP_WIDTH_PX) and ry <= vy <= (ry + rh):
+        if rx <= vx <= max(rx + GRIP_WIDTH_PX, rx + rw - RIGHT_ICON_RESERVE_PX) and ry <= vy <= (ry + rh):
             return {
                 "kind": "session",
                 "skey": item["skey"],
@@ -187,7 +195,8 @@ def hit_test_start(snap: dict, vx: float, vy: float) -> dict | None:
     for item in snap["level2"]:
         rx, ry, rw, rh = item["rect"]
         if int(item.get("tab_count", 2)) >= 2:
-            if rx <= vx <= (rx + GRIP_WIDTH_PX) and ry <= vy <= (ry + rh):
+            x_end = (rx + rw - RIGHT_ICON_RESERVE_PX) if item.get("has_sub") else (rx + rw)
+            if rx <= vx <= max(rx + GRIP_WIDTH_PX, x_end) and ry <= vy <= (ry + rh):
                 return {
                     "kind": "tab",
                     "tab_id": item["tab_id"],
@@ -209,10 +218,12 @@ def compute_hover_target(snap: dict, drag_item: dict, vx: float, vy: float):
         if not groups or vy < y_min - 50 or vy > y_max + 160:
             return None
         best_gid = None
+        best_group = None
         for g in groups:
             gx, gy, gw, gh = g["rect"]
             if gy <= vy <= gy + gh:
                 best_gid = g["id"]
+                best_group = g["rect"]
                 break
         if best_gid is None:
             best_dist = 1e9
@@ -222,23 +233,46 @@ def compute_hover_target(snap: dict, drag_item: dict, vx: float, vy: float):
                 if dist < best_dist:
                     best_dist = dist
                     best_gid = g["id"]
+                    best_group = g["rect"]
         if best_gid is None:
             return None
 
-        g_sessions = [s for s in snap["level1"] if s.get("group") == best_gid]
-        best_pos = None
-        if g_sessions:
-            first_y = min(s["rect"][1] for s in g_sessions)
-            if vy >= first_y - 8:
-                best_sdist = 1e9
-                for s in g_sessions:
-                    rx, ry, rw, rh = s["rect"]
-                    cy = ry + rh * 0.5
-                    dist = abs(vy - cy)
-                    if dist < best_sdist:
-                        best_sdist = dist
-                        best_pos = int(s.get("pos", 1))
-        return {"group": best_gid, "pos": best_pos}
+        gy, gh = best_group[1], best_group[3]
+        g_sessions = sorted(
+            [s for s in snap["level1"] if s.get("group") == best_gid],
+            key=lambda s: s["rect"][1],
+        )
+        if not g_sessions:
+            return {"group": best_gid, "pos": 1}
+
+        n = len(g_sessions)
+        if drag_item.get("start_group") == best_gid:
+            # Intra-group: only slots 1..N exist, so land on the slot covering the cursor.
+            first = g_sessions[0]
+            if vy <= first["rect"][1] + first["rect"][3]:
+                return {"group": best_gid, "pos": int(first.get("pos", 1))}
+            best_pos = int(g_sessions[-1].get("pos", n))
+            for i in range(n - 1):
+                cur, nxt = g_sessions[i], g_sessions[i + 1]
+                if vy <= (cur["rect"][1] + cur["rect"][3] + nxt["rect"][1]) * 0.5:
+                    best_pos = int(cur.get("pos", i + 1))
+                    break
+            return {"group": best_gid, "pos": best_pos}
+
+        # Cross-group: slots 1..N+1, N+1 appends after the last session.
+        for i in range(n - 1):
+            cur, nxt = g_sessions[i], g_sessions[i + 1]
+            if vy <= (cur["rect"][1] + cur["rect"][3] + nxt["rect"][1]) * 0.5:
+                return {"group": best_gid, "pos": int(cur.get("pos", i + 1))}
+        last = g_sessions[-1]
+        lry, lrh = last["rect"][1], last["rect"][3]
+        lrbot = lry + lrh
+        gbot = gy + gh
+        # Unfolded tabs sit under the header: header row = N, below it = N+1. Folded: 65/35 split.
+        last_split_y = lrbot if (gbot > lrbot + 10.0) else (lry + lrh * 0.65)
+        if vy <= last_split_y:
+            return {"group": best_gid, "pos": int(last.get("pos", n))}
+        return {"group": best_gid, "pos": n + 1}
     if drag_item["kind"] == "tab":
         siblings = [
             t for t in snap["level2"]
@@ -491,20 +525,35 @@ def worker_loop(kv_path: str):
             if pos is not None:
                 vx, vy, cw, _ch = pos
                 press_pos = (vx, vy)
+                bounds = cached_snap.get("bounds")
+                in_band = (
+                    (bounds[0] - 60 <= vx <= bounds[2] + 60)
+                    if bounds
+                    else (vx <= cw * 0.65 or vx >= cw * 0.35)
+                )
+                refreshed = False
+                if in_band:
+                    try:
+                        st = os.stat(kv_path)
+                        if st.st_mtime != last_kv_mtime:
+                            last_kv_mtime = st.st_mtime
+                            refreshed = True
+                    except Exception:
+                        pass
+                    if not refreshed and (now - cached_snap.get("ts", 0.0)) > 1.2:
+                        refreshed = True
+                if refreshed:
+                    snap = snapshot_geometry(kv_path)
+                    if snap.get("valid"):
+                        cached_snap = snap
+                    refreshed = bool(snap.get("valid"))
                 if cached_snap.get("valid"):
                     drag_item = hit_test_start(cached_snap, vx, vy)
-                if drag_item is None:
-                    bounds = cached_snap.get("bounds")
-                    in_band = (
-                        (bounds[0] - 60 <= vx <= bounds[2] + 60)
-                        if bounds
-                        else (vx <= cw * 0.65 or vx >= cw * 0.35)
-                    )
-                    if in_band:
-                        snap = snapshot_geometry(kv_path)
-                        if snap.get("valid"):
-                            cached_snap = snap
-                            drag_item = hit_test_start(cached_snap, vx, vy)
+                if drag_item is None and in_band and not refreshed:
+                    snap = snapshot_geometry(kv_path)
+                    if snap.get("valid"):
+                        cached_snap = snap
+                        drag_item = hit_test_start(cached_snap, vx, vy)
                 if drag_item is not None:
                     write_status(data_dir, {
                         "pid": int(my_pid),
@@ -547,7 +596,7 @@ def worker_loop(kv_path: str):
                                         "hover_pos": hover,
                                     }
                                 })
-            time.sleep(0.010)
+            time.sleep(0.008)
             continue
 
         if not is_down and was_down:
@@ -603,7 +652,8 @@ def worker_loop(kv_path: str):
                         })
                     else:
                         update_kv(kv_path, {"drag_state": {"active": False}})
-                    last_periodic_snap = 0.0
+                    # Let window.luau apply drag_drop before a fallback snapshot re-reads geometry.
+                    last_periodic_snap = time.monotonic() - 2.35
             dragging = False
             drag_item = None
             press_pos = None

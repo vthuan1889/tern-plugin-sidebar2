@@ -1,8 +1,20 @@
 /* --------------------------------------------------------------------------
- * sidebar2 — Fixed Kanban Sidebar (TODO / Processing / DONE)
+ * sidebar2 — Fixed Kanban Sidebar (TODO / WORKING / REVIEW / PAUSED / STUCK / DONE)
  * Scoped to [data-role^="sidebar2."]
  * Matches Tern's native Settings (prefs.css) & Files (files.css) UI look.
  * -------------------------------------------------------------------------- */
+
+/* Tern's sheet (Settings) carries its own head; the sidebar canvas has one too, so the pane
+ * header is hidden and its body rounds like a sheet.
+ * shortcut: Tern's CSS engine has no :has(), so the pane is matched by its header title; change
+ * SIDEBAR_TITLE and this selector together. */
+header.tn-head[title="Kanban"] {
+  display: none !important;
+}
+
+header.tn-head[title="Kanban"] + .tn-body {
+  border-radius: var(--tn-island-r, 12px) !important;
+}
 
 .sf-region[data-surface="plugin.tern.canvas"][data-role^="sidebar2."],
 .sf-region[data-surface="plugin.tern.canvas"] [data-role^="sidebar2."],
@@ -38,7 +50,7 @@
   background: color-mix(in srgb, var(--b2) 65%, transparent);
 }
 
-/* Kanban Group Container (TODO / Processing / DONE) — no outer border */
+/* Kanban Group Container (TODO / WORKING / REVIEW / PAUSED / STUCK / DONE) — no outer border */
 [data-role^="sidebar2.group"] {
   margin: 4px 4px 8px 4px !important;
   padding: 2px 4px 4px 4px !important;
@@ -108,77 +120,60 @@
 }
 
 /* --------------------------------------------------------------------------
- * Status Colors by Group (TODO = #35c7e6, PROCESSING = #febc38, DONE = #89d281)
- * Applies to Level 1 left border and Level 1 & Level 2 backgrounds.
+ * Stage colors: each group column publishes --stage; the rules below read it.
+ * TODO #35c7e6 · WORKING #febc38 · REVIEW #a371f7 · PAUSED #8b949e · STUCK #f85149 · DONE #89d281
  * -------------------------------------------------------------------------- */
 
-/* TODO (info: #35c7e6) */
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.level1"],
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.level1.current"] {
-  border-left: 2px solid #35c7e6 !important;
-  box-shadow: inset 2px 0 0 #35c7e6 !important;
+[data-role="sidebar2.group.todo"]   { --stage: #35c7e6; }
+[data-role="sidebar2.group.doing"]  { --stage: #febc38; }
+[data-role="sidebar2.group.review"] { --stage: #a371f7; }
+[data-role="sidebar2.group.paused"] { --stage: #8b949e; }
+[data-role="sidebar2.group.stuck"]  { --stage: #f85149; }
+[data-role="sidebar2.group.done"]   { --stage: #89d281; }
+
+[data-role^="sidebar2.group."] [data-role="sidebar2.level1"],
+[data-role^="sidebar2.group."] [data-role="sidebar2.level1.current"] {
+  border-left: 2px solid var(--stage) !important;
+  box-shadow: inset 2px 0 0 var(--stage) !important;
 }
 
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.level1"]:hover {
-  background: rgba(53, 199, 230, 0.08) !important;
+[data-role^="sidebar2.group."] [data-role="sidebar2.level1"]:hover {
+  background: color-mix(in srgb, var(--stage) 8%, transparent) !important;
 }
 
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.level1.current"] {
-  background: rgba(53, 199, 230, 0.16) !important;
+[data-role^="sidebar2.group."] [data-role="sidebar2.level1.current"] {
+  background: color-mix(in srgb, var(--stage) 16%, transparent) !important;
 }
 
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.level2"]:hover {
-  background: rgba(53, 199, 230, 0.07) !important;
+[data-role^="sidebar2.group."] [data-role="sidebar2.level2"]:hover {
+  background: color-mix(in srgb, var(--stage) 7%, transparent) !important;
 }
 
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.level2.current"] {
-  background: rgba(53, 199, 230, 0.14) !important;
+[data-role^="sidebar2.group."] [data-role="sidebar2.level2.current"] {
+  background: color-mix(in srgb, var(--stage) 14%, transparent) !important;
 }
 
-/* PROCESSING (warning: #febc38) */
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.level1"],
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.level1.current"] {
-  border-left: 2px solid #febc38 !important;
-  box-shadow: inset 2px 0 0 #febc38 !important;
+/* REVIEW / PAUSED / STUCK have no native tone token: tint their header label from --stage. */
+[data-role="sidebar2.group.review"] [data-role="sidebar2.group_head"] > :first-child *,
+[data-role="sidebar2.group.paused"] [data-role="sidebar2.group_head"] > :first-child *,
+[data-role="sidebar2.group.stuck"] [data-role="sidebar2.group_head"] > :first-child * {
+  color: var(--stage) !important;
 }
 
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.level1"]:hover {
-  background: rgba(254, 188, 56, 0.08) !important;
+/* Insertion line for the slot the dragged row will land in. */
+[data-role^="sidebar2."][data-mark="drop_before"] {
+  box-shadow: inset 0 2px 0 var(--accent) !important;
+  background: color-mix(in srgb, var(--accent) 14%, transparent) !important;
 }
 
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.level1.current"] {
-  background: rgba(254, 188, 56, 0.16) !important;
+[data-role^="sidebar2."][data-mark="drop_after"] {
+  box-shadow: inset 0 -2px 0 var(--accent) !important;
+  background: color-mix(in srgb, var(--accent) 14%, transparent) !important;
 }
 
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.level2"]:hover {
-  background: rgba(254, 188, 56, 0.07) !important;
-}
-
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.level2.current"] {
-  background: rgba(254, 188, 56, 0.14) !important;
-}
-
-/* DONE (success: #89d281) */
-[data-role="sidebar2.group.done"] [data-role="sidebar2.level1"],
-[data-role="sidebar2.group.done"] [data-role="sidebar2.level1.current"] {
-  border-left: 2px solid #89d281 !important;
-  box-shadow: inset 2px 0 0 #89d281 !important;
-}
-
-[data-role="sidebar2.group.done"] [data-role="sidebar2.level1"]:hover {
-  background: rgba(137, 210, 129, 0.08) !important;
-}
-
-[data-role="sidebar2.group.done"] [data-role="sidebar2.level1.current"] {
-  background: rgba(137, 210, 129, 0.16) !important;
-}
-
-[data-role="sidebar2.group.done"] [data-role="sidebar2.level2"]:hover {
-  background: rgba(137, 210, 129, 0.07) !important;
-}
-
-[data-role="sidebar2.group.done"] [data-role="sidebar2.level2.current"] {
-  background: rgba(137, 210, 129, 0.14) !important;
+[data-role^="sidebar2."][data-mark="drop_target"] {
+  outline: 1px dashed var(--accent) !important;
+  background: color-mix(in srgb, var(--accent) 10%, transparent) !important;
 }
 
 /* Full-width clickable title areas inside Level 1 and Level 2 rows */
@@ -189,6 +184,20 @@
   align-self: stretch !important;
   padding: 2px 4px !important;
   cursor: pointer !important;
+}
+
+/* Leading program icon of a tab (Level 2) and a pane (Level 3): 13px matches the 12px row text */
+[data-role="sidebar2.l2_title"] .sf-icon,
+[data-role^="sidebar2.level3"] .sf-icon {
+  width: 13px !important;
+  height: 13px !important;
+  flex: 0 0 13px !important;
+}
+
+[data-role="sidebar2.l2_title"] .sf-icon svg.ico,
+[data-role^="sidebar2.level3"] .sf-icon svg.ico {
+  width: 13px !important;
+  height: 13px !important;
 }
 
 /* Level 3: Pane Row (no left border) */
@@ -291,6 +300,27 @@
   animation: none !important;
 }
 
+/* User-set "mark to read" flag: red-orange, faster blink than the agent status icon. */
+.sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.tab_mark"],
+[data-role="sidebar2.tab_mark"],
+[data-role="sidebar2.tab_mark"] * {
+  font-size: 10px !important;
+  line-height: 13px !important;
+}
+
+[data-role="sidebar2.tab_mark"] {
+  margin: 1px 2px !important;
+  padding: 1px 5px !important;
+  border-radius: 999px !important;
+  color: #ff6b6b !important;
+  background: rgba(255, 107, 107, 0.22) !important;
+  border: 1px solid rgba(255, 107, 107, 0.65) !important;
+  font-weight: 700 !important;
+  cursor: pointer !important;
+  overflow: visible !important;
+  animation: sidebar2-status-blink 0.85s ease-in-out infinite !important;
+}
+
 /* Context Menu Section Divider ("-" in actions.menu -> empty button.mi) */
 div.pop > button.mi:empty {
   height: 1px !important;
@@ -303,20 +333,19 @@ div.pop > button.mi:empty {
   border-radius: 0 !important;
   pointer-events: none !important;
 }
+
+/* Context Menu Checkmark: place the active ✓ icon at the trailing end of menuitem */
+div.pop > button.mi > span.mi-ck {
+  order: 2 !important;
+  margin-left: auto !important;
+  margin-right: 0 !important;
+}
 [data-role="sidebar2.level3"]:hover {
   background: color-mix(in srgb, var(--t1) 6%, transparent);
 }
 
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.level3.current"] {
-  background: rgba(53, 199, 230, 0.10) !important;
-}
-
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.level3.current"] {
-  background: rgba(254, 188, 56, 0.10) !important;
-}
-
-[data-role="sidebar2.group.done"] [data-role="sidebar2.level3.current"] {
-  background: rgba(137, 210, 129, 0.10) !important;
+[data-role^="sidebar2.group."] [data-role="sidebar2.level3.current"] {
+  background: color-mix(in srgb, var(--stage) 10%, transparent) !important;
 }
 
 /* Bottom Pinned Dock */
@@ -324,4 +353,73 @@ div.pop > button.mi:empty {
   padding: 5px 8px !important;
   border-top: 1px solid var(--l2);
   background: color-mix(in srgb, var(--b2) 70%, transparent);
+}
+
+/* Agent Count Badges in Group Headers (total / running / idle) */
+[data-role="sidebar2.group_counts"] {
+  margin: 0 !important;
+  padding: 0 !important;
+  gap: 4px !important;
+  background: none !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+[data-role="sidebar2.count.total"],
+[data-role="sidebar2.count.running"],
+[data-role="sidebar2.count.idle"],
+[data-role="sidebar2.count.zero"],
+[data-role="sidebar2.count.off"],
+.sf-region[data-surface="plugin.tern.canvas"] [data-role^="sidebar2."] [data-role^="sidebar2.count"] {
+  font-size: 10.5px !important;
+  line-height: 14px !important;
+  padding: 1px 6px !important;
+  border-radius: 999px !important;
+  font-weight: 700 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  cursor: pointer !important;
+}
+
+[data-role="sidebar2.count.total"] {
+  color: #35c7e6 !important;
+  background: rgba(53, 199, 230, 0.18) !important;
+  border: 1px solid rgba(53, 199, 230, 0.50) !important;
+}
+
+[data-role="sidebar2.count.running"] {
+  color: #febc38 !important;
+  background: rgba(254, 188, 56, 0.20) !important;
+  border: 1px solid rgba(254, 188, 56, 0.55) !important;
+}
+
+[data-role="sidebar2.count.idle"] {
+  color: #89d281 !important;
+  background: rgba(137, 210, 129, 0.18) !important;
+  border: 1px solid rgba(137, 210, 129, 0.50) !important;
+}
+
+[data-role="sidebar2.count.zero"] {
+  color: color-mix(in srgb, var(--t1) 70%, transparent) !important;
+  background: color-mix(in srgb, var(--t1) 10%, transparent) !important;
+  border: 1px solid var(--l2) !important;
+}
+
+[data-role="sidebar2.count.off"] {
+  opacity: 0.48 !important;
+  cursor: pointer !important;
+}
+
+/* Footer Dock: badge visibility filter bar */
+[data-role="sidebar2.dock_filter"] {
+  padding: 2px 0 5px 0 !important;
+  margin-bottom: 4px !important;
+  border-bottom: 1px solid var(--l2);
+  gap: 4px !important;
+}
+
+[data-role="sidebar2.dock_filter"] [data-role="sidebar2.count.off"] {
+  color: var(--t2, inherit) !important;
+  background: transparent !important;
+  border: 1px dashed var(--l2) !important;
 }
