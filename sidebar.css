@@ -38,15 +38,6 @@
   background: color-mix(in srgb, var(--b2) 65%, transparent);
 }
 
-/* Pick Mode Banner (Drag & Drop Stage 2) */
-[data-role="sidebar2.pick_banner"] {
-  margin: 4px 6px 6px 6px !important;
-  padding: 5px 8px !important;
-  border: 1px dashed var(--accent) !important;
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--accent) 12%, transparent) !important;
-}
-
 /* Kanban Group Container (TODO / Processing / DONE) — no outer border */
 [data-role^="sidebar2.group"] {
   margin: 4px 4px 8px 4px !important;
@@ -67,31 +58,6 @@
 
 [data-role="sidebar2.group_head"]:hover {
   background: color-mix(in srgb, var(--t1) 7%, transparent);
-}
-
-/* Drop Zone when Pick Mode is active */
-[data-role="sidebar2.drop_zone"] {
-  margin: 3px 4px !important;
-  padding: 5px 8px !important;
-  border: 1px dashed var(--accent) !important;
-  border-radius: 5px;
-  background: color-mix(in srgb, var(--accent) 12%, transparent) !important;
-  cursor: grabbing !important;
-}
-
-[data-role="sidebar2.group.todo"] [data-role="sidebar2.drop_zone"] {
-  border-color: #35c7e6 !important;
-  background: rgba(53, 199, 230, 0.14) !important;
-}
-
-[data-role="sidebar2.group.doing"] [data-role="sidebar2.drop_zone"] {
-  border-color: #febc38 !important;
-  background: rgba(254, 188, 56, 0.14) !important;
-}
-
-[data-role="sidebar2.group.done"] [data-role="sidebar2.drop_zone"] {
-  border-color: #89d281 !important;
-  background: rgba(137, 210, 129, 0.14) !important;
 }
 
 /* Empty Group Placeholder */
@@ -237,8 +203,8 @@
   cursor: pointer;
 }
 
-[data-role="sidebar2.level3"] > .sf-text:first-child,
-[data-role="sidebar2.level3.current"] > .sf-text:first-child {
+[data-role="sidebar2.level3"] .sf-text,
+[data-role="sidebar2.level3.current"] .sf-text {
   flex: 1 1 auto !important;
   min-width: 0 !important;
 }
@@ -257,18 +223,7 @@
   padding: 0 2px !important;
 }
 
-@keyframes sidebar2-working-blink {
-  0%, 100% {
-    transform: scale(0.78);
-    opacity: 0.35;
-  }
-  50% {
-    transform: scale(0.92);
-    opacity: 1;
-  }
-}
-
-@keyframes sidebar2-unread-blink {
+@keyframes sidebar2-status-blink {
   0%, 100% {
     transform: scale(0.78);
     opacity: 0.35;
@@ -309,7 +264,7 @@
   border: 1px solid rgba(254, 188, 56, 0.55) !important;
   font-weight: 700 !important;
   overflow: visible !important;
-  animation: sidebar2-working-blink 0.95s ease-in-out infinite !important;
+  animation: sidebar2-status-blink 0.95s ease-in-out infinite !important;
 }
 
 [data-role="sidebar2.status.unread"] {
@@ -321,7 +276,7 @@
   border: 1px solid rgba(137, 210, 129, 0.60) !important;
   font-weight: 700 !important;
   overflow: visible !important;
-  animation: sidebar2-unread-blink 1.05s ease-in-out infinite !important;
+  animation: sidebar2-status-blink 1.05s ease-in-out infinite !important;
 }
 
 [data-role="sidebar2.status.read"] {

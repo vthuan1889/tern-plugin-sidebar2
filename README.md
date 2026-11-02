@@ -46,14 +46,16 @@ the segment is always there.
 
 | Level | Row | Shows | Click |
 | --- | --- | --- | --- |
-| — | Toolbar | session count, `⇄` flip side, `⊟` fold all, `↻` refresh, `Hide ✕` | acts immediately |
+| — | Toolbar | session count, `R`/`L` side flip, fold all, refresh (icon buttons with tooltips) | acts immediately |
 | 2 | Group header | `TODO` / `PROCESSING` / `DONE`, count badge, chevron | folds the column |
-| 1 | Session | host badge, session name, `2t` = tab count, `●` current, `⟳` busy | switches to the session |
-| 2 | Tab | `#order`, tab title, `2p` = pane count, `●` current, `⟳` busy | focuses the tab |
-| 3 | Pane | kind glyph, pane title, `·` subtitle, status badge | focuses the pane |
+| 1 | Session | host badge, session name, `2t` = tab count, `✦` badge | switches to the session |
+| 2 | Tab | `#order`, tab title, `2p` = pane count, `✦` badge | focuses the tab |
+| 3 | Pane | Tern icon for the pane kind, pane title, `·` subtitle, status badge | focuses the pane |
 
 Level 3 appears only for tabs holding **2 or more panes** — single-pane tabs stay compact.
-Status badges: `!` error, `⟳` running, `●` focused, otherwise the pane kind.
+The status badge is a `✦` pill: yellow and blinking while the agent works, green and blinking when a
+finished agent is unread, dim once read, and nothing while idle. Hovering a row shows a tooltip with the
+session/tab/pane detail.
 
 Row tint plus the accent bar mark the current session, tab and pane. Long names are truncated at 20
 characters (sessions) and 24 (tabs).
@@ -64,9 +66,9 @@ characters (sessions) and 24 (tabs).
 
 Three equivalent ways, all stored per session:
 
-1. **Grip-and-drop** — click the `⠿` grip on a session row. A banner appears, every column header turns
-   into `↓ Drop here` and each column shows a `↓ Move session to …` target. Click one. `Cancel ✕` in the
-   banner aborts instead.
+1. **Grip-and-drop** — click the `⠿` grip on a session row. Every column header turns into
+   `↓ Drop here` and each session row of the target column shows `↕ #<position>`. Click a header to move
+   the session there, or a row to drop it at that position. Clicking the grip again cancels.
 2. **Row menu** — right-click the session row (or its grip): `Move to TODO`, `Move to Processing`,
    `Move to DONE`.
 3. **`Move…` in the dock** — a picker listing every session × column, with the current column as detail.
@@ -84,24 +86,26 @@ the first manual move on, the column is yours and the plugin stops touching it. 
 
 Click `⠿` on a tab row (the grip appears when the session has **2 or more** tabs) → the tab turns `🎯`
 and the header shows `↕ Move Tab: …`. Now click `⠿` on any other tab of the same session: the picked tab
-is moved to that position. The tab menu also has `←` / `→` for one step at a time.
+is moved to that position. The tab menu also has `Move Tab Up` / `Move Tab Down` for one step at a time.
 
 ## Row menus
 
 | Row | Menu items |
 | --- | --- |
-| Group header | Fold / unfold column · New session in *this column* |
-| Session | Pick · Move to TODO · Move to Processing · Move to DONE · New tab here · Rename session |
-| Tab | Focus · Pick *(2+ tabs)* · Move to previous position · Move to next position · Rename · Close tab |
-| Pane | Focus · Split right · Split down · Close pane |
+| Group header | New session in *this column* · Collapse / Expand column |
+| Session | New tab here · Focus · Rename · Move to TODO / Processing / DONE *(radio group, current one checked)* · Pick *(drag)* · Move up / down |
+| Tab | New tab · Close tab *(danger)* · Focus · Rename · Pick *(2+ tabs)* · Move up / down |
+| Pane | Focus · Split right · Split down · Close pane *(danger)* |
 
-`Close tab` closes every non-sidebar pane in that tab. `+ Session` (dock) asks for a name — leave it
-empty for an auto-generated one — and places the session in **TODO**.
+`Close tab` closes every non-sidebar pane in that tab. The dock holds two buttons: `Session` asks for a
+name — leave it empty for an auto-generated one — and places the session in **TODO**; `Move…` opens the
+picker above.
 
 ## Placement
 
 The strip is a canvas pane pinned to the left edge of the active tab at **20%** of its width; it follows
-you when you switch sessions, tabs or hosts, one strip per host. `⇄` moves it to the right edge.
+you when you switch sessions, tabs or hosts, one strip per host. The `R` / `L` toolbar button moves it to
+the other edge.
 
 Width is fixed, not drag-resizable.
 
@@ -131,8 +135,8 @@ Because the column key includes the session **name**, renaming a session resets 
 ## Troubleshooting
 
 - Sidebar gone → click the `Kanban: OFF` status-bar segment, or `tern plugin reload sidebar2`.
-- Two strips in one tab → the plugin cleans up stale canvases 2.5 s after a pane is created; use `↻`
-  to force a re-render, or close the extra canvas like any pane.
+- Two strips in one tab → the plugin cleans up stale canvases 2.5 s after a pane is created; use the
+  refresh button to force a re-render, or close the extra canvas like any pane.
 - Plugin not listed → `tern plugin list`, then check `plugins_disabled` in Tern's settings.
 - Uninstall: `tern plugin remove sidebar2` (or `tern plugin unlink sidebar2` for a linked checkout).
 
