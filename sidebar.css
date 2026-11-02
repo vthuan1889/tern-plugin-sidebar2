@@ -335,15 +335,18 @@ header.tn-head[title="Kanban"] + .tn-body {
   animation: none !important;
 }
 
-/* User-set "mark to read" flag: red-orange, faster blink than the agent status icon. */
+/* User-set "mark to read" flag: red-orange, faster blink than the agent status icon.
+ * The stage header (`group_mark`) reuses it so a stage holding a marked tab blinks too. */
 .sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.tab_mark"],
-[data-role="sidebar2.tab_mark"],
-[data-role="sidebar2.tab_mark"] * {
+.sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.group_mark"],
+[data-role="sidebar2.tab_mark"], [data-role="sidebar2.group_mark"],
+[data-role="sidebar2.tab_mark"] *, [data-role="sidebar2.group_mark"] * {
   font-size: 10px !important;
   line-height: 13px !important;
 }
 
-[data-role="sidebar2.tab_mark"] {
+[data-role="sidebar2.tab_mark"],
+[data-role="sidebar2.group_mark"] {
   margin: 1px 2px !important;
   padding: 1px 5px !important;
   border-radius: 999px !important;

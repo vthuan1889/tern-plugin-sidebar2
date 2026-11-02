@@ -580,6 +580,7 @@ type GroupAgentCounts = {
 	running: number,
 	idle: number,
 	waiting: number,
+	marked: number,
 }
 
 type CollectedData = {
@@ -862,7 +863,7 @@ local function collect_data(cx: WindowCx): CollectedData
 	local group_counts: { [GroupId]: GroupAgentCounts } = {}
 	for _, g in ipairs(GROUPS) do
 		by_group[g.id] = {}
-		group_counts[g.id] = { total = 0, running = 0, idle = 0, waiting = 0 }
+		group_counts[g.id] = { total = 0, running = 0, idle = 0, waiting = 0, marked = 0 }
 	end
 	local state_dirty = false
 
@@ -1088,6 +1089,12 @@ local function collect_data(cx: WindowCx): CollectedData
 			end
 		end
 
+		for _, t in ipairs(tab_entries) do
+			if persisted.marked_tabs[tostring(t.id)] == true then
+				gcounts.marked += 1
+			end
+		end
+
 		if is_cur_sess then
 			local gspec = GROUP_BY_ID[grp] or GROUPS[1]
 			current_stage_label = gspec.short
@@ -1208,6 +1215,7 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 			tostring(counts.running),
 			tostring(counts.idle),
 			tostring(counts.waiting),
+			tostring(counts.marked),
 			tostring(persisted.badge_vis.total),
 			tostring(persisted.badge_vis.running),
 			tostring(persisted.badge_vis.idle),
@@ -1413,6 +1421,19 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 		if is_group_drop_target then
 			table.insert(head_right_children, ui.badge("↓ Drop here", g.tone))
 		else
+			-- The stage itself flags that it holds work to read, even when the tab is folded away.
+			if counts.marked > 0 then
+				table.insert(
+					head_right_children,
+					ui.node("badge", {
+						key = "mark_g_" .. g.id,
+						role = "sidebar2.group_mark",
+						text = if counts.marked > 1 then "⚑ " .. tostring(counts.marked) else "⚑",
+						tone = "error",
+						title = "Tab cần đọc ở " .. g.label .. ": " .. tostring(counts.marked),
+					})
+				)
+			end
 			if persisted.badge_vis.total ~= false and not (hide_zero and counts.total == 0) then
 				table.insert(
 					head_right_children,
@@ -3868,11 +3889,15 @@ local function refresh_plan_pending(cx: WindowCx)
 		return
 	end
 	for _, a in ipairs(alist) do
-		if a.state == "idle" and type(a.pane) == "number" then
+		-- A plan can leave the block `idle` or sitting at `waiting_input`; only a running turn
+		-- cannot be waiting for approval.
+		if (a.state == "idle" or a.state == "waiting_input") and type(a.pane) == "number" then
 			local ok_t, msgs = pcall(function()
 				return cx.agents:transcript(a.pane, { last = 12 })
 			end)
-			-- Walk back from the newest message: a user reply after the plan closes it.
+			-- The plan waits only while nothing came after it: the nearest user message or any
+			-- other tool closes it. omp keeps working in the same turn after the approval, so a
+			-- propose followed by edits is a plan already being carried out.
 			if ok_t and type(msgs) == "table" then
 				local pending = false
 				for i = #msgs, 1, -1 do
@@ -3880,10 +3905,17 @@ local function refresh_plan_pending(cx: WindowCx)
 					if m.role == "user" then
 						break
 					end
+					local proposals, others = 0, 0
 					for _, t in ipairs(m.tools or {}) do
 						if t.title == "propose" and t.status == "done" then
-							pending = true
+							proposals += 1
+						elseif t.title ~= nil then
+							others += 1
 						end
+					end
+					if proposals > 0 or others > 0 then
+						pending = (proposals > 0 and others == 0)
+						break
 					end
 				end
 				if pending then
