@@ -38,12 +38,14 @@ for _, g in ipairs(GROUPS) do
 	GROUP_BY_ID[g.id] = g
 end
 
-type BadgeKey = "total" | "running" | "idle" | "hide_zero"
+type BadgeKey = "total" | "running" | "idle" | "waiting" | "hide_zero"
 
 type BadgeVis = {
 	total: boolean,
 	running: boolean,
 	idle: boolean,
+	-- Agent awaits the user: `waiting_input`, a rung bell or a plan to approve.
+	waiting: boolean,
 	-- Hide a count badge whose value is 0 instead of showing "0".
 	hide_zero: boolean,
 }
@@ -94,6 +96,7 @@ local function load_state(): PersistedState
 		total = if type(raw_bv.total) == "boolean" then raw_bv.total else true,
 		running = if type(raw_bv.running) == "boolean" then raw_bv.running else true,
 		idle = if type(raw_bv.idle) == "boolean" then raw_bv.idle else true,
+		waiting = if type(raw_bv.waiting) == "boolean" then raw_bv.waiting else true,
 		hide_zero = if type(raw_bv.hide_zero) == "boolean" then raw_bv.hide_zero else false,
 	}
 	return {
@@ -153,6 +156,9 @@ local painted_fp: { [number]: string } = {}
 -- Absent for a pane that must be repainted whole (`painted_fp` is nil then).
 local painted_sec_fp: { [number]: { [string]: string } } = {}
 local pane_notif: { [number]: "waiting" | "done" | "error" } = {}
+-- Panes whose agent proposed a plan and still waits for the user's approval: omp's `propose`
+-- tool leaves the block `idle`, so refresh_plan_pending() reads the transcript for it.
+local plan_pending: { [number]: boolean } = {}
 local prev_pane_busy: { [number]: boolean } = {}
 local known_agents: { [number]: boolean } = {}
 local ack_alerts: { [number]: boolean } = {}
@@ -191,6 +197,8 @@ local function ensure_drag_helper(force: boolean?)
 end
 local opened_at_ms: { [number]: number } = {}
 local synced_tab_ratio: { [number]: number } = {}
+-- The tab the strip was last placed in: a width change here (not on arrival) came from the divider.
+local last_placed_tab: number? = nil
 local last_user_pane_by_tab: { [number]: number } = {}
 -- Focus order for "start in" tie-breaks: higher means focused more recently.
 local focus_rank: { [number]: number } = {}
@@ -453,13 +461,15 @@ end
 -- ---------------------------------------------------------------------------
 -- 3-Level Data Model & Collector
 -- ---------------------------------------------------------------------------
-type ItemStatus = "none" | "read" | "unread" | "working"
+type ItemStatus = "none" | "read" | "unread" | "waiting" | "working"
 
+-- A waiting agent outranks a plain unread one: it is the case that needs the user now.
 local STATUS_PRIO: { [ItemStatus]: number } = {
 	none = 0,
 	read = 1,
 	unread = 2,
-	working = 3,
+	waiting = 3,
+	working = 4,
 }
 
 local function merge_status(a: ItemStatus, b: ItemStatus): ItemStatus
@@ -526,6 +536,8 @@ type PaneEntry = {
 	title: string,
 	sub: string?,
 	busy: boolean,
+	-- Not working, but the user owes it an answer: ask, bell or a plan to approve.
+	waiting: boolean,
 	err: boolean,
 	status: ItemStatus,
 	focused: boolean,
@@ -567,6 +579,7 @@ type GroupAgentCounts = {
 	total: number,
 	running: number,
 	idle: number,
+	waiting: number,
 }
 
 type CollectedData = {
@@ -849,7 +862,7 @@ local function collect_data(cx: WindowCx): CollectedData
 	local group_counts: { [GroupId]: GroupAgentCounts } = {}
 	for _, g in ipairs(GROUPS) do
 		by_group[g.id] = {}
-		group_counts[g.id] = { total = 0, running = 0, idle = 0 }
+		group_counts[g.id] = { total = 0, running = 0, idle = 0, waiting = 0 }
 	end
 	local state_dirty = false
 
@@ -908,6 +921,17 @@ local function collect_data(cx: WindowCx): CollectedData
 						local pfocused = (focused == pid)
 							or (is_visible_tab and (last_user_pane_by_tab[t.id] == pid or last_user_pane_by_tab[t.id] == nil))
 						local pviewed = pfocused or is_visible_tab
+						-- Tern also reports `waiting_input` for an agent merely sitting at its prompt, so
+						-- only a blocked one (`busy`) waits; the rest is the plan it proposed. A leftover
+						-- `waiting` notification and a rung bell outlive the moment and made idle panes wait.
+						local pwaiting = not pbusy
+							and (
+								(astate == "waiting_input" and pinfo.busy == true)
+								or plan_pending[pid] == true
+							)
+						if pane_notif[pid] == "waiting" and not pwaiting then
+							pane_notif[pid] = nil
+						end
 						if is_agent then
 							known_agents[pid] = true
 						end
@@ -916,33 +940,39 @@ local function collect_data(cx: WindowCx): CollectedData
 							ack_alerts[pid] = false
 							prev_pane_busy[pid] = true
 						else
+							-- Only the pane the user actually focused counts as seen: a finished agent
+							-- keeps its blinking mark while it merely sits in the open tab.
 							if prev_pane_busy[pid] == true then
 								prev_pane_busy[pid] = false
-								if not pviewed then
+								if not pfocused then
 									pane_notif[pid] = "done"
 								end
 							end
 							if pinfo.alert ~= true then
 								ack_alerts[pid] = false
 							end
-							if pviewed then
+							if pfocused then
 								pane_notif[pid] = nil
 								if pinfo.alert == true then
 									ack_alerts[pid] = true
 								end
+							elseif pviewed and pinfo.alert == true then
+								ack_alerts[pid] = true
 							end
 						end
+						-- A plain shell running a command is not an agent finishing work: only agent panes
+						-- get a status mark, so a cmd tab/session never shows the blinking icon.
 						local pstatus: ItemStatus = "none"
-						if pbusy then
-							pstatus = "working"
-						elseif
-							astate == "waiting_input"
-							or (pinfo.alert == true and not ack_alerts[pid])
-							or pane_notif[pid] ~= nil
-						then
-							pstatus = "unread"
-						elseif known_agents[pid] then
-							pstatus = "read"
+						if is_agent then
+							if pbusy then
+								pstatus = "working"
+							elseif pwaiting then
+								pstatus = "waiting"
+							elseif (pinfo.alert == true and not ack_alerts[pid]) or pane_notif[pid] ~= nil then
+								pstatus = "unread"
+							elseif known_agents[pid] then
+								pstatus = "read"
+							end
 						end
 						local raw_title = if pinfo.title and pinfo.title ~= "" and pinfo.title ~= SIDEBAR_TITLE
 							then pinfo.title
@@ -972,6 +1002,7 @@ local function collect_data(cx: WindowCx): CollectedData
 							title = short_text(raw_title, 90),
 							sub = sub,
 							busy = pbusy,
+							waiting = pwaiting,
 							err = perr,
 							status = pstatus,
 							focused = pfocused,
@@ -1048,6 +1079,8 @@ local function collect_data(cx: WindowCx): CollectedData
 					gcounts.total += 1
 					if p.busy then
 						gcounts.running += 1
+					elseif p.waiting then
+						gcounts.waiting += 1
 					else
 						gcounts.idle += 1
 					end
@@ -1155,6 +1188,7 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 		tostring(persisted.badge_vis.total),
 		tostring(persisted.badge_vis.running),
 		tostring(persisted.badge_vis.idle),
+		tostring(persisted.badge_vis.waiting),
 		tostring(badge_cfg_open),
 		tostring(stage_cfg_open),
 	}
@@ -1173,9 +1207,11 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 			tostring(counts.total),
 			tostring(counts.running),
 			tostring(counts.idle),
+			tostring(counts.waiting),
 			tostring(persisted.badge_vis.total),
 			tostring(persisted.badge_vis.running),
 			tostring(persisted.badge_vis.idle),
+			tostring(persisted.badge_vis.waiting),
 			tostring(persisted.badge_vis.hide_zero),
 		}
 		-- Dragging repaints from the drop handlers themselves; keeping the state here means a
@@ -1275,6 +1311,13 @@ local function status_icon_node(key: string, st: ItemStatus): Node?
 			role = "sidebar2.status.working",
 			text = "✦",
 			tone = "warning",
+		})
+	elseif st == "waiting" then
+		return ui.node("badge", {
+			key = key,
+			role = "sidebar2.status.waiting",
+			text = "✦",
+			tone = "error",
 		})
 	elseif st == "unread" then
 		return ui.node("badge", {
@@ -1382,6 +1425,18 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					})
 				)
 			end
+			if persisted.badge_vis.idle ~= false and not (hide_zero and counts.idle == 0) then
+				table.insert(
+					head_right_children,
+					ui.node("badge", {
+						key = "cnt_idl_" .. g.id,
+						role = "sidebar2.count.idle",
+						text = tostring(counts.idle),
+						tone = "success",
+						title = "Agent đang idle: " .. tostring(counts.idle),
+					})
+				)
+			end
 			if persisted.badge_vis.running ~= false and not (hide_zero and counts.running == 0) then
 				table.insert(
 					head_right_children,
@@ -1394,15 +1449,15 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					})
 				)
 			end
-			if persisted.badge_vis.idle ~= false and not (hide_zero and counts.idle == 0) then
+			if persisted.badge_vis.waiting ~= false and not (hide_zero and counts.waiting == 0) then
 				table.insert(
 					head_right_children,
 					ui.node("badge", {
-						key = "cnt_idl_" .. g.id,
-						role = "sidebar2.count.idle",
-						text = tostring(counts.idle),
-						tone = "success",
-						title = "Agent đang idle: " .. tostring(counts.idle),
+						key = "cnt_wait_" .. g.id,
+						role = "sidebar2.count.waiting",
+						text = tostring(counts.waiting),
+						tone = "error",
+						title = "Agent chờ phản hồi: " .. tostring(counts.waiting),
 					})
 				)
 			end
@@ -1600,11 +1655,13 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 							},
 						}, {
 							ui.badge(sess.host_name, host_badge_tone),
+							ui.node("badge", {
+								key = "name_s_" .. sess.skey,
+								role = "sidebar2.l1_sess",
+								text = short_text(sess.name, 20),
+								tone = "accent",
+							}),
 							ui.text({
-								ui.span(
-									short_text(sess.name, 20),
-									if sess.current then "strong" else nil
-								),
 								ui.span(" " .. tostring(#sess.tabs) .. "t", "muted"),
 							}),
 						}),
@@ -1948,14 +2005,19 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 			checked = (persisted.badge_vis.total ~= false),
 		},
 		{
+			id = "toggle_badge=idle",
+			label = "Agent đang idle (Idle)",
+			checked = (persisted.badge_vis.idle ~= false),
+		},
+		{
 			id = "toggle_badge=running",
 			label = "Agent đang chạy (Running)",
 			checked = (persisted.badge_vis.running ~= false),
 		},
 		{
-			id = "toggle_badge=idle",
-			label = "Agent đang idle (Idle)",
-			checked = (persisted.badge_vis.idle ~= false),
+			id = "toggle_badge=waiting",
+			label = "Agent chờ phản hồi (Waiting)",
+			checked = (persisted.badge_vis.waiting ~= false),
 		},
 		"-",
 		{
@@ -1984,6 +2046,14 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					actions = { click = "toggle_badge=total" },
 				}),
 				ui.node("badge", {
+					key = "flt_idle",
+					role = if persisted.badge_vis.idle then "sidebar2.count.idle" else "sidebar2.count.off",
+					text = (if persisted.badge_vis.idle then "✓ " else "○ ") .. "Idle",
+					tone = if persisted.badge_vis.idle then "success" else "neutral",
+					title = "Ẩn/hiện Agent đang idle",
+					actions = { click = "toggle_badge=idle" },
+				}),
+				ui.node("badge", {
 					key = "flt_running",
 					role = if persisted.badge_vis.running then "sidebar2.count.running" else "sidebar2.count.off",
 					text = (if persisted.badge_vis.running then "✓ " else "○ ") .. "Chạy",
@@ -1992,12 +2062,12 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					actions = { click = "toggle_badge=running" },
 				}),
 				ui.node("badge", {
-					key = "flt_idle",
-					role = if persisted.badge_vis.idle then "sidebar2.count.idle" else "sidebar2.count.off",
-					text = (if persisted.badge_vis.idle then "✓ " else "○ ") .. "Idle",
-					tone = if persisted.badge_vis.idle then "success" else "neutral",
-					title = "Ẩn/hiện Agent đang idle",
-					actions = { click = "toggle_badge=idle" },
+					key = "flt_waiting",
+					role = if persisted.badge_vis.waiting then "sidebar2.count.waiting" else "sidebar2.count.off",
+					text = (if persisted.badge_vis.waiting then "✓ " else "○ ") .. "Chờ phản hồi",
+					tone = if persisted.badge_vis.waiting then "error" else "neutral",
+					title = "Ẩn/hiện Agent chờ phản hồi",
+					actions = { click = "toggle_badge=waiting" },
 				}),
 				ui.node("badge", {
 					key = "flt_zero",
@@ -2201,7 +2271,6 @@ end
 
 local function find_host_sidebar(
 	cx: WindowCx,
-	host_id: number,
 	active_tab_id: number?,
 	owned: { [number]: boolean }
 ): number?
@@ -2214,23 +2283,16 @@ local function find_host_sidebar(
 			live[pid] = true
 		end
 	end
-	local host_pane_set = host_pane_map(cx, host_id)
-
+	-- One strip per tab, each opened at the saved ratio and left in place. A single strip moved
+	-- between tabs is re-split at 0.5 first, so the width visibly jumped on every switch.
 	local chosen: number? = nil
 	local extras: { number } = {}
 	for spane, _ in pairs(live) do
-		local tab_id = cx.session:tab_of(spane)
-		local on_host = host_pane_set[spane] or (active_tab_id ~= nil and tab_id == active_tab_id)
-		if on_host then
-			if active_tab_id and tab_id == active_tab_id and chosen ~= spane then
-				if chosen then
-					table.insert(extras, chosen)
-				end
-				chosen = spane
-			elseif not chosen then
-				chosen = spane
-			else
+		if active_tab_id ~= nil and cx.session:tab_of(spane) == active_tab_id then
+			if chosen then
 				table.insert(extras, spane)
+			else
+				chosen = spane
 			end
 		end
 	end
@@ -2438,14 +2500,23 @@ place_sidebar_at_edge = function(
 		return moved_tabs
 	end
 	local prev = synced_tab_ratio[tab_id]
-	if not moved_tabs and prev and math.abs(cur_share - prev) > 0.5 / persisted.cols_est then
-		-- The divider was dragged by hand: that width is the one every session keeps, not drift to
+	if tab_id == last_placed_tab and prev and math.abs(cur_share - prev) > 0.5 / persisted.cols_est then
+		-- The divider was dragged by hand: that width is the one every strip keeps, not drift to
 		-- correct back to the default.
 		persisted.ratio = clamp(cur_share, MIN_SIDEBAR_RATIO, MAX_SIDEBAR_RATIO)
 		save_state()
 		target_ratio = persisted.ratio
+		-- Resize the other tabs' strips now, while they are hidden, so arriving in one never shows
+		-- a correction.
+		for other, _ in pairs(live_host_canvases(cx)) do
+			local other_tab = cx.session:tab_of(other)
+			if other_tab and other_tab ~= tab_id then
+				match_ratio(cx, other, other_tab, side, target_ratio)
+			end
+		end
 	end
 	match_ratio(cx, spane, tab_id, side, target_ratio)
+	last_placed_tab = tab_id
 	-- Remember where a settled strip sits: a hand drag then accumulates against it until it passes
 	-- the deadband, instead of each small step being re-seeded and never adopted.
 	local ok_f, lay_f = pcall(function()
@@ -2607,7 +2678,7 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 			return
 		end
 
-		local spane = find_host_sidebar(cx, active_host_id, tab_id, data.owned)
+		local spane = find_host_sidebar(cx, tab_id, data.owned)
 		local fp, sec_fp = build_fingerprint(data)
 
 		-- Building the tree is the expensive half of a sync, so it only happens when something
@@ -3152,7 +3223,7 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		sync_and_render(cx, true)
 		return true
 	elseif cmd == "toggle_badge" then
-		if val == "total" or val == "running" or val == "idle" or val == "hide_zero" then
+		if val == "total" or val == "running" or val == "idle" or val == "waiting" or val == "hide_zero" then
 			local k = val :: BadgeKey
 			persisted.badge_vis[k] = not (persisted.badge_vis[k] ~= false)
 			save_state()
@@ -3729,7 +3800,7 @@ local function step_body(cx: WindowCx)
 		local data = collect_data(cx)
 		local fp = build_fingerprint(data)
 		local cur_host = if ok_cs and cur_s then cur_s.host else 0
-		local spane = find_host_sidebar(cx, cur_host, data.active_tab_id, data.owned)
+		local spane = find_host_sidebar(cx, data.active_tab_id, data.owned)
 		if data.active_tab_id and not spane then
 			active_sidebar_pane = nil
 			sync_and_render(cx, true)
@@ -3784,6 +3855,52 @@ tern.on("window_start", function(cx: WindowCx)
 end)
 
 start_watcher()
+
+-- omp's `propose` tool ends the turn with a plan the user must approve, and the block stays
+-- `idle` while it waits, so the badge reads the tail of the transcript once in a while.
+-- shortcut: 2s sweep and the `propose` tool title, revisit if omp renames the tool.
+local function refresh_plan_pending(cx: WindowCx)
+	local next_pending: { [number]: boolean } = {}
+	local ok_a, alist = pcall(function()
+		return cx.agents:list()
+	end)
+	if not ok_a or type(alist) ~= "table" then
+		return
+	end
+	for _, a in ipairs(alist) do
+		if a.state == "idle" and type(a.pane) == "number" then
+			local ok_t, msgs = pcall(function()
+				return cx.agents:transcript(a.pane, { last = 12 })
+			end)
+			-- Walk back from the newest message: a user reply after the plan closes it.
+			if ok_t and type(msgs) == "table" then
+				local pending = false
+				for i = #msgs, 1, -1 do
+					local m = msgs[i]
+					if m.role == "user" then
+						break
+					end
+					for _, t in ipairs(m.tools or {}) do
+						if t.title == "propose" and t.status == "done" then
+							pending = true
+						end
+					end
+				end
+				if pending then
+					next_pending[a.pane] = true
+				end
+			end
+		end
+	end
+	plan_pending = next_pending
+end
+
+tern.timer(2000, function(cx: WindowCx?)
+	if cx then
+		pcall(refresh_plan_pending, cx)
+	end
+end)
+
 tern.timer(20, function(cx: WindowCx?)
 	if cx then
 		ensure_status_bar(cx)

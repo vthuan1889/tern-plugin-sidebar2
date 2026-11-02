@@ -125,9 +125,9 @@ four switches.
 
 ## Placement
 
-The strip is a canvas pane pinned to the left edge of the active tab at **20%** of its width; it follows
-you when you switch sessions, tabs or hosts, one strip per host. The `R` / `L` toolbar button moves it to
-the other edge.
+The strip is a canvas pane pinned to the left edge of **every** tab at **20%** of its width; switching
+tabs or sessions shows the strip already there at that width, so it never resizes. The `R` / `L` toolbar
+button moves every strip to the other edge.
 
 A canvas pane lives in the session's daemon, so a **remote host must run a Tern new enough to host
 canvases** (0.9.9 or later). An older host reports no error: `canvas:open` hands back a plain pane and

@@ -186,6 +186,22 @@ header.tn-head[title="Kanban"] + .tn-body {
   cursor: pointer !important;
 }
 
+/* Level 1 session-name pill: accent tone from `data-tone`, shrinkable so a long name ellipsizes
+ * instead of overflowing the row; the host pill keeps its own neutral/info tone. */
+[data-role="sidebar2.l1_sess"] {
+  display: block !important;
+  flex: 0 1 auto !important;
+  min-width: 0 !important;
+  margin-left: 4px !important;
+  line-height: 18px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+[data-role="sidebar2.level1.current"] [data-role="sidebar2.l1_sess"] {
+  font-weight: 600 !important;
+}
+
 /* Leading program icon of a tab (Level 2) and a pane (Level 3): 13px matches the 12px row text */
 [data-role="sidebar2.l2_title"] .sf-icon,
 [data-role^="sidebar2.level3"] .sf-icon {
@@ -274,6 +290,25 @@ header.tn-head[title="Kanban"] + .tn-body {
   font-weight: 700 !important;
   overflow: visible !important;
   animation: sidebar2-status-blink 0.95s ease-in-out infinite !important;
+}
+
+[data-role="sidebar2.status.waiting"] {
+  margin: 1px 3px 1px auto !important;
+  padding: 1px 5px !important;
+  border-radius: 999px !important;
+  color: #ff6b6b !important;
+  background: rgba(255, 107, 107, 0.22) !important;
+  border: 1px solid rgba(255, 107, 107, 0.60) !important;
+  font-weight: 700 !important;
+  overflow: visible !important;
+  animation: sidebar2-status-blink 0.7s ease-in-out infinite !important;
+}
+
+.sf-region[data-surface="plugin.tern.canvas"] [data-role="sidebar2.status.waiting"],
+[data-role="sidebar2.status.waiting"],
+[data-role="sidebar2.status.waiting"] * {
+  font-size: 10px !important;
+  line-height: 13px !important;
 }
 
 [data-role="sidebar2.status.unread"] {
@@ -368,6 +403,7 @@ div.pop > button.mi > span.mi-ck {
 [data-role="sidebar2.count.total"],
 [data-role="sidebar2.count.running"],
 [data-role="sidebar2.count.idle"],
+[data-role="sidebar2.count.waiting"],
 [data-role="sidebar2.count.zero"],
 [data-role="sidebar2.count.off"],
 .sf-region[data-surface="plugin.tern.canvas"] [data-role^="sidebar2."] [data-role^="sidebar2.count"] {
@@ -399,6 +435,26 @@ div.pop > button.mi > span.mi-ck {
   border: 1px solid rgba(137, 210, 129, 0.50) !important;
 }
 
+[data-role="sidebar2.count.waiting"] {
+  color: #ff6b6b !important;
+  background: rgba(255, 107, 107, 0.20) !important;
+  border: 1px solid rgba(255, 107, 107, 0.55) !important;
+}
+
+@keyframes sidebar2-count-blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.42;
+  }
+}
+
+/* Only the group header counts blink; the dock filter pill keeps its steady look. */
+[data-role="sidebar2.group_counts"] [data-role="sidebar2.count.waiting"] {
+  animation: sidebar2-count-blink 1.1s ease-in-out infinite !important;
+}
+
 [data-role="sidebar2.count.zero"] {
   color: color-mix(in srgb, var(--t1) 70%, transparent) !important;
   background: color-mix(in srgb, var(--t1) 10%, transparent) !important;
@@ -416,6 +472,7 @@ div.pop > button.mi > span.mi-ck {
   margin-bottom: 4px !important;
   border-bottom: 1px solid var(--l2);
   gap: 4px !important;
+  flex-wrap: wrap !important;
 }
 
 [data-role="sidebar2.dock_filter"] [data-role="sidebar2.count.off"] {
