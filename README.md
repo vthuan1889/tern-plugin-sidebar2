@@ -31,8 +31,8 @@ tern plugin reload sidebar2
 
 ![Four ways to show or hide the sidebar](docs/entry-points.svg)
 
-The toggle is reachable even when the sidebar is hidden — the plugin turns on the `status_bar` setting so
-the segment is always there.
+The toggle is reachable even when the sidebar is hidden. The status-bar segment appears when the
+`status_bar` setting is on; the plugin never turns it on for you.
 
 | Entry point | Where |
 | --- | --- |

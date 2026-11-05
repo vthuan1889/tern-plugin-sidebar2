@@ -403,12 +403,7 @@ div.pop > button.mi > span.mi-ck {
   box-shadow: none !important;
 }
 
-[data-role="sidebar2.count.total"],
-[data-role="sidebar2.count.running"],
-[data-role="sidebar2.count.idle"],
-[data-role="sidebar2.count.waiting"],
-[data-role="sidebar2.count.zero"],
-[data-role="sidebar2.count.off"],
+[data-role^="sidebar2.count."],
 .sf-region[data-surface="plugin.tern.canvas"] [data-role^="sidebar2."] [data-role^="sidebar2.count"] {
   font-size: 10.5px !important;
   line-height: 14px !important;
@@ -426,19 +421,22 @@ div.pop > button.mi > span.mi-ck {
   border: 1px solid rgba(53, 199, 230, 0.50) !important;
 }
 
-[data-role="sidebar2.count.running"] {
+[data-role="sidebar2.count.running"],
+[data-role="sidebar2.count.running.blink"] {
   color: #febc38 !important;
   background: rgba(254, 188, 56, 0.20) !important;
   border: 1px solid rgba(254, 188, 56, 0.55) !important;
 }
 
-[data-role="sidebar2.count.idle"] {
+[data-role="sidebar2.count.idle"],
+[data-role="sidebar2.count.idle.blink"] {
   color: #89d281 !important;
   background: rgba(137, 210, 129, 0.18) !important;
   border: 1px solid rgba(137, 210, 129, 0.50) !important;
 }
 
-[data-role="sidebar2.count.waiting"] {
+[data-role="sidebar2.count.waiting"],
+[data-role="sidebar2.count.waiting.blink"] {
   color: #ff6b6b !important;
   background: rgba(255, 107, 107, 0.20) !important;
   border: 1px solid rgba(255, 107, 107, 0.55) !important;
@@ -453,8 +451,10 @@ div.pop > button.mi > span.mi-ck {
   }
 }
 
-/* Only the group header counts blink; the dock filter pill keeps its steady look. */
-[data-role="sidebar2.group_counts"] [data-role="sidebar2.count.waiting"] {
+/* Only a group count with a matching blinking stage icon blinks; the dock filter pill stays steady. */
+[data-role="sidebar2.group_counts"] [data-role="sidebar2.count.idle.blink"],
+[data-role="sidebar2.group_counts"] [data-role="sidebar2.count.running.blink"],
+[data-role="sidebar2.group_counts"] [data-role="sidebar2.count.waiting.blink"] {
   animation: sidebar2-count-blink 1.1s ease-in-out infinite !important;
 }
 

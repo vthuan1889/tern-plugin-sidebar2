@@ -149,6 +149,10 @@ local last_drag_end_ms = 0
 local last_drop_seq = 0
 local dom_map_seq = 0
 local last_dom_map_fp = ""
+-- Tab titles for `tern.chrome.tab_title`: the first user pane of each tab, published by
+-- collect_data. The chrome formatter only receives a TabInfo, so the value has to be cached.
+-- shortcut: while the sidebar is hidden no sync runs, so labels keep the last shown titles.
+local chrome_tab_titles: { [number]: string } = {}
 local helper_running = false
 local last_helper_check_ms = 0
 local painted_fp: { [number]: string } = {}
@@ -448,17 +452,6 @@ local function find_best_sibling_tab(
 end
 
 -- ---------------------------------------------------------------------------
--- Helper: Ensure status bar is visible so the Show/Hide button is always accessible
--- ---------------------------------------------------------------------------
-local function ensure_status_bar(cx: WindowCx)
-	pcall(function()
-		if cx.settings:get("status_bar") ~= true then
-			cx.settings:set("status_bar", true)
-		end
-	end)
-end
-
--- ---------------------------------------------------------------------------
 -- 3-Level Data Model & Collector
 -- ---------------------------------------------------------------------------
 type ItemStatus = "none" | "read" | "unread" | "waiting" | "working"
@@ -579,6 +572,7 @@ type GroupAgentCounts = {
 	total: number,
 	running: number,
 	idle: number,
+	unread: number,
 	waiting: number,
 	marked: number,
 }
@@ -863,7 +857,7 @@ local function collect_data(cx: WindowCx): CollectedData
 	local group_counts: { [GroupId]: GroupAgentCounts } = {}
 	for _, g in ipairs(GROUPS) do
 		by_group[g.id] = {}
-		group_counts[g.id] = { total = 0, running = 0, idle = 0, waiting = 0, marked = 0 }
+		group_counts[g.id] = { total = 0, running = 0, idle = 0, unread = 0, waiting = 0, marked = 0 }
 	end
 	local state_dirty = false
 
@@ -1020,16 +1014,20 @@ local function collect_data(cx: WindowCx): CollectedData
 			end
 			sess_status_kind = merge_status(sess_status_kind, tab_status_kind)
 
-			local tab_title = if t.name and t.name ~= "" and t.name ~= SIDEBAR_TITLE
+			-- A tab is named by its first user pane, never by whichever pane holds focus: `t.title`
+			-- and `t.program` are the focused pane's, so they are not labels. Nothing resolves when
+			-- a tab has no visible user pane (parked panes, canvas only).
+			local first_label: string? = if t.name and t.name ~= "" and t.name ~= SIDEBAR_TITLE
 				then t.name
 				elseif primary_user_title and primary_user_title ~= "" then primary_user_title
-				elseif t.title and t.title ~= "" and t.title ~= SIDEBAR_TITLE then t.title
-				elseif t.program and t.program ~= "" then t.program
-				else ("Tab " .. tostring(idx))
+				else nil
+			local tab_title = first_label or ("Tab " .. tostring(idx))
 			local tab_stripped = strip_leading_title_icon(tab_title)
 			if tab_stripped ~= "" then
 				tab_title = tab_stripped
 			end
+			-- nil leaves Tern's default tab title in the chrome.
+			chrome_tab_titles[t.id] = if first_label then tab_title else nil
 
 			-- The tab shows its agent pane's icon: a busy one, else the focused one, else any.
 			local tab_agent_icon = tab_agent_icon_of(pane_entries) or agent_icon_from_text(t.program)
@@ -1084,6 +1082,9 @@ local function collect_data(cx: WindowCx): CollectedData
 						gcounts.waiting += 1
 					else
 						gcounts.idle += 1
+						if p.status == "unread" then
+							gcounts.unread += 1
+						end
 					end
 				end
 			end
@@ -1214,6 +1215,7 @@ local function build_fingerprint(data: CollectedData): (string, { [string]: stri
 			tostring(counts.total),
 			tostring(counts.running),
 			tostring(counts.idle),
+			tostring(counts.unread),
 			tostring(counts.waiting),
 			tostring(counts.marked),
 			tostring(persisted.badge_vis.total),
@@ -1451,7 +1453,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					head_right_children,
 					ui.node("badge", {
 						key = "cnt_idl_" .. g.id,
-						role = "sidebar2.count.idle",
+						role = if counts.unread > 0 then "sidebar2.count.idle.blink" else "sidebar2.count.idle",
 						text = tostring(counts.idle),
 						tone = "success",
 						title = "Agent đang idle: " .. tostring(counts.idle),
@@ -1463,7 +1465,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					head_right_children,
 					ui.node("badge", {
 						key = "cnt_run_" .. g.id,
-						role = "sidebar2.count.running",
+						role = if counts.running > 0 then "sidebar2.count.running.blink" else "sidebar2.count.running",
 						text = tostring(counts.running),
 						tone = "warning",
 						title = "Agent đang chạy: " .. tostring(counts.running),
@@ -1475,7 +1477,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					head_right_children,
 					ui.node("badge", {
 						key = "cnt_wait_" .. g.id,
-						role = "sidebar2.count.waiting",
+						role = if counts.waiting > 0 then "sidebar2.count.waiting.blink" else "sidebar2.count.waiting",
 						text = tostring(counts.waiting),
 						tone = "error",
 						title = "Agent chờ phản hồi: " .. tostring(counts.waiting),
@@ -2588,10 +2590,6 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 	local drag_fast = last_drag_active and not force_paint and active_sidebar_pane ~= nil
 
 	local ok, err = pcall(function()
-		if not drag_fast then
-			ensure_status_bar(cx)
-		end
-
 		if not persisted.visible then
 			close_all_sidebars(cx)
 			return
@@ -2969,7 +2967,6 @@ local function set_sidebar_visible(cx: WindowCx, visible: boolean)
 		hover_tab_pos = nil
 	end
 	save_state()
-	ensure_status_bar(cx)
 	if not visible then
 		stop_watcher()
 		close_all_sidebars(cx)
@@ -3620,6 +3617,13 @@ tern.chrome.status(function(_pane: StatusPaneInfo): { StatusSegment }?
 	end
 end)
 
+-- The vertical tab strip and tab menus name a tab by its first user pane (see collect_data); nil
+-- keeps Tern's default. collect_data refills the cache and sync_and_render already calls
+-- `tern.chrome.refresh()` after painting, which drops the formatter's per-input cache.
+tern.chrome.tab_title(function(tab: TabInfo): string?
+	return chrome_tab_titles[tab.id]
+end)
+
 tern.files.button({
 	id = "toggle",
 	title = "Toggle Kanban Sidebar (Ctrl+Alt+B)",
@@ -3869,7 +3873,6 @@ function start_watcher()
 end
 
 tern.on("window_start", function(cx: WindowCx)
-	ensure_status_bar(cx)
 	ensure_drag_helper(true)
 	sync_and_render(cx, true)
 	start_watcher()
@@ -3927,15 +3930,22 @@ local function refresh_plan_pending(cx: WindowCx)
 	plan_pending = next_pending
 end
 
-tern.timer(2000, function(cx: WindowCx?)
-	if cx then
+-- `tern.timer` is one-shot: a sweep must re-arm itself or a plan proposed after the plugin
+-- loaded waits forever unseen (the block stays `idle`, so nothing else wakes this up).
+local function schedule_plan_sweep()
+	tern.timer(2000, function(cx: WindowCx?)
+		if not cx then
+			return
+		end
 		pcall(refresh_plan_pending, cx)
-	end
-end)
+		schedule_plan_sweep()
+	end)
+end
+
+schedule_plan_sweep()
 
 tern.timer(20, function(cx: WindowCx?)
 	if cx then
-		ensure_status_bar(cx)
 		ensure_drag_helper(true)
 		sync_and_render(cx, true)
 	end
