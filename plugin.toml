@@ -1,7 +1,7 @@
 schema = 1
 id = "sidebar2"
 name = "Sidebar Kanban"
-version = "0.3.0"
+version = "0.4.0"
 description = "Fixed Kanban sidebar (TODO / WORKING / REVIEW / PAUSED / STUCK / DONE) managing Host + Session, Tabs, and Panes."
 icon = "kanban"
 window = "window.luau"

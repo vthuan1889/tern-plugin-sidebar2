@@ -37,9 +37,45 @@ The toggle is reachable even when the sidebar is hidden. The status-bar segment 
 | Entry point | Where |
 | --- | --- |
 | Status bar | `Kanban: ON · <stage>` / `Kanban: OFF` segment, click to toggle |
+| Widget bar | `sidebar2/kanban` widget (`WORKING · 4 agent · 1 chạy`, or `OFF`), click to toggle |
 | Files view | Kanban icon button in the Files toolbar |
 | Command palette | `Kanban Sidebar: Show / Hide Toggle` |
 | Keybind | `Ctrl+Alt+B` (`Cmd+Alt+B` on macOS) |
+
+The widget is not placed for you: add it once in the palette's `Edit widgets…`, and the window foot keeps
+it from then on. Its counts come from the same per-stage tallies as the column badges.
+
+## Tổng quan (overview tab)
+
+A second surface: a tab named **Tổng quan** in a locked session **Kanban Tổng quan** on the local PC,
+always reachable from any sidebar — including one drawn while the window shows a remote host (the
+window switches back to the local host).
+
+- Left pane **Tổng quan** — the same six columns, every session on every host with its tabs; a host badge
+  and `✦`count pills show running/waiting agents. Clicking a session or a tab row focuses it.
+- Right pane **Agent chờ** — three groups, each row showing host · session · tab detail; clicking a row
+  focuses that pane:
+  - **AGENT ĐANG CHỜ** — `chờ trả lời` (blocked on a question) or `chờ duyệt plan` (an omp `propose`
+    awaiting approval). Red `✦`, warning/error text.
+  - **AI AGENT CHƯA XEM** — `làm xong · chưa xem`: the agent finished and you have not looked at the pane
+    yet (the plugin's `unread` state). Green `✦`. Focusing the pane marks it seen and the row drops out;
+    an agent that is merely idle at its prompt is never listed.
+  - **TAB - AI AGENT ĐANG ĐÁNH DẤU** — every tab flagged `⚑`, with its stage; click the row to focus the
+    tab, click the `⚑` (or its right-click menu) to clear the flag. An empty group says so instead of
+    hiding.
+- Open it with the `eye` button in the toolbar, the command palette (`Kanban Sidebar: Mở Tổng quan
+  (tab trên PC)`), or its right-click menu (`Làm mới`). Opening it again only focuses the existing tab;
+  closing one pane, both, or the whole tab is repaired by the next open.
+- The board is interactive, with the sidebar's own controls on every row:
+  - **Drag** a session card (or click its `⠿` grip) into any of the six columns, including `REVIEW`,
+    `PAUSED`, `STUCK`; a drop on a stage header puts it first, and `↕ #<n>` marks the slot. Tabs reorder
+    the same way; `⚑` marks a tab to read.
+  - **`+` on a session card** opens a tab in that session (`New Tab omp` in its right-click menu) and
+    follows it there — switching host first when the session lives on another one.
+  - **`Session`** in the header creates a session, **`Move…`** moves any session between stages.
+- No sidebar strip is placed on the overview tab, and the overview session never appears on the board.
+- The two panes repaint on focus, on every sidebar sync and from the 2 s plan sweep, so the board and
+  the waiting list stay live even while the sidebar is hidden.
 
 ## Anatomy
 
@@ -47,7 +83,7 @@ The toggle is reachable even when the sidebar is hidden. The status-bar segment 
 
 | Level | Row | Shows | Click |
 | --- | --- | --- | --- |
-| — | Toolbar | session count, `R`/`L` side flip, fold all, refresh, hide `×` (icon buttons with tooltips) | acts immediately |
+| — | Toolbar | session count, overview `eye`, `R`/`L` side flip, fold all, refresh, hide `×` (icon buttons with tooltips) | acts immediately |
 | 2 | Group header | `TODO` / `WORKING` / `REVIEW` / `PAUSED` / `STUCK` / `DONE`, agent count badges (`Tổng` / `Chạy` / `Idle`), chevron | folds the column |
 | 1 | Session | host badge, session name, `2t` = tab count, `✦` badge | switches to the session |
 | 2 | Tab | program icon (the AI agent's when one runs in it, else `terminal`), `#order`, tab title, `2p` = pane count, `✦` badge | focuses the tab |
@@ -82,6 +118,11 @@ Press anywhere on a session row (the fold chevron on its right stays click-only)
 column takes it, and the row edge it will land on shows an accent line — top edge = before that row,
 bottom edge = after it. The last row carries `↕ #<position>` while a drag appends past the end of a
 column. Releasing drops the session at that exact slot; dragging inside its own column reorders it in place.
+Tabs drag the same way within their session.
+
+This works on both surfaces — the sidebar and the `Tổng quan` board — including the board's wrapped 2D
+columns: a press lands in a stage by its box, so a short or empty column takes the drop anywhere in its
+row's height.
 
 ### Auto-promotion
 
@@ -165,6 +206,7 @@ Because the column key includes the session **name**, renaming a session resets 
 | `plugin.sidebar2.hide` | hide |
 | `plugin.sidebar2.flip_side` | switch left ↔ right edge |
 | `plugin.sidebar2.move_session` | open the `Move…` picker |
+| `plugin.sidebar2.overview` | open / focus the local **Tổng quan** tab |
 
 ## Troubleshooting
 

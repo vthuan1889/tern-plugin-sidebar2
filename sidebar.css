@@ -478,8 +478,155 @@ div.pop > button.mi > span.mi-ck {
   flex-wrap: wrap !important;
 }
 
-[data-role="sidebar2.dock_filter"] [data-role="sidebar2.count.off"] {
-  color: var(--t2, inherit) !important;
-  background: transparent !important;
-  border: 1px dashed var(--l2) !important;
+/* --------------------------------------------------------------------------
+ * Overview surfaces: the local `Tổng quan` board and the `Agent chờ` list.
+ * Same pane-header treatment as the sidebar; the canvases draw their own heads.
+ * Kept last: the board wraps its six columns, which must beat the base row rule.
+ * -------------------------------------------------------------------------- */
+header.tn-head[title="Tổng quan"],
+header.tn-head[title="Agent chờ"],
+header.tn-head[title="Không có pane"] { display: none !important; }
+
+header.tn-head[title="Tổng quan"] + .tn-body,
+header.tn-head[title="Agent chờ"] + .tn-body,
+header.tn-head[title="Không có pane"] + .tn-body { border-radius: var(--tn-island-r, 12px) !important; }
+
+[data-role="sidebar2.ov.root"],
+[data-role="sidebar2.ov.wait_root"] { padding: 6px !important; }
+
+/* Empty session: one centered box, whatever size the main area has. */
+[data-role="sidebar2.empty_sess.root"] {
+  display: flex !important;
+  flex-direction: column !important;
+  flex: 1 1 auto !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: 100% !important;
+  min-height: 100% !important;
+}
+
+[data-role="sidebar2.empty_sess.box"] {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 10px !important;
+  padding: 24px 32px !important;
+  margin: auto !important;
+  text-align: center !important;
+}
+
+[data-role="sidebar2.ov.head"] {
+  padding: 4px 6px !important;
+  margin-bottom: 4px !important;
+  border-bottom: 1px solid var(--l2);
+}
+
+/* A head opens a section of its own, under whatever group came before it. */
+[data-role="sidebar2.ov.wait"] + [data-role="sidebar2.ov.head"],
+[data-role="sidebar2.ov.empty"] + [data-role="sidebar2.ov.head"],
+[data-role="sidebar2.ov.head"] + [data-role="sidebar2.ov.head"] {
+  margin-top: 8px !important;
+}
+
+/* `.sf-row` is repeated so these tie with the base row rule and win by source order. */
+[data-role="sidebar2.ov.board"].sf-row {
+  flex-wrap: wrap !important;
+  align-items: flex-start !important;
+  gap: 8px !important;
+}
+
+[data-role^="sidebar2.ov.stage."] {
+  flex: 1 1 170px !important;
+  min-width: 160px !important;
+  padding: 4px !important;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--b2) 32%, transparent);
+}
+
+[data-role="sidebar2.ov.stage.todo"]   { --stage: #35c7e6; }
+[data-role="sidebar2.ov.stage.doing"]  { --stage: #febc38; }
+[data-role="sidebar2.ov.stage.review"] { --stage: #a371f7; }
+[data-role="sidebar2.ov.stage.paused"] { --stage: #8b949e; }
+[data-role="sidebar2.ov.stage.stuck"]  { --stage: #f85149; }
+[data-role="sidebar2.ov.stage.done"]   { --stage: #89d281; }
+
+[data-role^="sidebar2.ov.stage."] [data-role="sidebar2.ov.stage_head"] > :first-child * {
+  color: var(--stage) !important;
+}
+
+[data-role="sidebar2.ov.card"],
+[data-role="sidebar2.ov.card.current"] {
+  margin: 2px 0 !important;
+  padding: 3px 6px !important;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+[data-role="sidebar2.ov.card"]:hover {
+  background: color-mix(in srgb, var(--stage) 10%, transparent) !important;
+}
+
+[data-role="sidebar2.ov.card.current"] {
+  background: color-mix(in srgb, var(--stage) 16%, transparent) !important;
+}
+
+[data-role="sidebar2.ov.tab"],
+[data-role="sidebar2.ov.tab.current"] {
+  margin: 1px 0 1px 10px !important;
+  padding: 1px 6px !important;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.9;
+}
+
+[data-role="sidebar2.ov.tab"]:hover {
+  background: color-mix(in srgb, var(--t1) 6%, transparent) !important;
+}
+
+[data-role="sidebar2.ov.tab.current"] { font-weight: 600 !important; }
+
+[data-role="sidebar2.ov.wait"] {
+  margin: 2px 0 !important;
+  padding: 4px 6px !important;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+[data-role="sidebar2.ov.wait"]:hover {
+  background: color-mix(in srgb, var(--t1) 6%, transparent) !important;
+}
+
+[data-role="sidebar2.ov.empty"] {
+  padding: 4px 8px !important;
+  opacity: 0.65;
+}
+
+/* Stage stripe on the board's cards, matching the sidebar's level-1 rows. */
+[data-role="sidebar2.ov.card"],
+[data-role="sidebar2.ov.card.current"] {
+  border-left: 2px solid var(--stage) !important;
+  box-shadow: inset 2px 0 0 var(--stage) !important;
+}
+
+/* Drag marks for the board's rows. Kept last in the sheet: the `:hover` rules above carry the
+ * same specificity, so only source order keeps an insertion line or a pick outline visible. */
+[data-role^="sidebar2.ov."][data-mark="drop_before"] {
+  box-shadow: inset 0 2px 0 var(--accent) !important;
+  background: color-mix(in srgb, var(--accent) 14%, transparent) !important;
+}
+
+[data-role^="sidebar2.ov."][data-mark="drop_after"] {
+  box-shadow: inset 0 -2px 0 var(--accent) !important;
+  background: color-mix(in srgb, var(--accent) 14%, transparent) !important;
+}
+
+[data-role^="sidebar2.ov."][data-mark="drop_target"] {
+  outline: 1px dashed var(--accent) !important;
+  background: color-mix(in srgb, var(--accent) 10%, transparent) !important;
+}
+
+[data-role^="sidebar2.ov."][data-mark="pick"] {
+  opacity: 0.65 !important;
+  outline: 1px dashed var(--accent) !important;
 }

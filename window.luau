@@ -8,6 +8,42 @@ local ui = tern.ui
 
 local SIDEBAR_TITLE = "Kanban"
 local SIDEBAR_ABOUT = "Fixed Kanban sidebar (TODO / WORKING / REVIEW / PAUSED / STUCK / DONE) organizing Host + Session, Tabs, and Panes."
+-- Second surface: a read-only Kanban board of every host, plus the agents waiting for the user.
+-- It lives in its own locked session on the local host, so it stays reachable from a remote sidebar.
+local OVERVIEW_TITLE = "Tổng quan"
+local WAITING_TITLE = "Agent chờ"
+local OVERVIEW_TAB = "Tổng quan"
+local OVERVIEW_SESSION = "Kanban Tổng quan"
+local OVERVIEW_ABOUT = "Kanban Tổng quan: board 6 cột và AI agent đang chờ trả lời/duyệt plan."
+local OVERVIEW_WAIT_RATIO = 0.34
+
+local function is_overview_title(title: string?): boolean
+	return title == OVERVIEW_TITLE or title == WAITING_TITLE
+end
+
+-- A session with no tabs is not handed to another session: it keeps a placeholder pane instead.
+local EMPTY_TITLE = "Không có pane"
+local EMPTY_ABOUT = "Session chưa có pane. Nhấn Tạo pane để mở terminal mới."
+
+local function is_empty_title(title: string?): boolean
+	return title == EMPTY_TITLE
+end
+
+-- True while the window shows the overview tab on the local host: the only moment its canvases
+-- can be painted and the sidebar must keep away.
+local function current_is_overview(cx: WindowCx): boolean
+	local ok_s, cur = pcall(function()
+		return cx.sessions:current()
+	end)
+	if not ok_s or not cur or cur.name ~= OVERVIEW_SESSION then
+		return false
+	end
+	local ok_h, host = pcall(function()
+		return cx.hosts:current()
+	end)
+	return ok_h and host ~= nil and host.kind == "local"
+end
+
 -- Width until a divider is dragged; from then on the dragged ratio is what every session gets.
 local FIXED_SIDEBAR_RATIO = 0.20
 local MIN_SIDEBAR_RATIO = 0.08
@@ -149,6 +185,20 @@ local last_drag_end_ms = 0
 local last_drop_seq = 0
 local dom_map_seq = 0
 local last_dom_map_fp = ""
+local last_ov_dom_map_fp = ""
+local last_surface_pub = ""
+-- Which surface is drawn right now. Both publish a DOM map, and their paint counters can tie
+-- while neither fingerprint changes, so drag_helper reads this instead of guessing.
+local function publish_surface(surface: string)
+	if last_surface_pub == surface then
+		return
+	end
+	last_surface_pub = surface
+	pcall(tern.kv.set, "dom_surface", { surface = surface })
+end
+-- The board's sync, defined with the overview surfaces below: the sidebar's own paint calls it so
+-- a `Tổng quan` repaint happens whichever surface the work started from.
+local sync_overview: any = nil
 -- Tab titles for `tern.chrome.tab_title`: the first user pane of each tab, published by
 -- collect_data. The chrome formatter only receives a TabInfo, so the value has to be cached.
 -- shortcut: while the sidebar is hidden no sync runs, so labels keep the last shown titles.
@@ -156,6 +206,9 @@ local chrome_tab_titles: { [number]: string } = {}
 local helper_running = false
 local last_helper_check_ms = 0
 local painted_fp: { [number]: string } = {}
+-- Placeholder panes of sessions that hold no user pane, plus their last painted fingerprint.
+local empty_panes: { [number]: boolean } = {}
+local painted_empty_fp: { [number]: string } = {}
 -- Per-section fingerprints of the last paint, so a sync can patch only the changed columns.
 -- Absent for a pane that must be repainted whole (`painted_fp` is nil then).
 local painted_sec_fp: { [number]: { [string]: string } } = {}
@@ -168,6 +221,10 @@ local known_agents: { [number]: boolean } = {}
 local ack_alerts: { [number]: boolean } = {}
 local closing_internally: { [number]: boolean } = {}
 local active_sidebar_pane: number? = nil
+-- Fingerprints of the last overview paint, plus the guard against a double host-switch.
+local overview_board_fp = ""
+local overview_wait_fp = ""
+local overview_opening = false
 
 do
 	local ok_dd, dd = pcall(tern.kv.get, "drag_drop")
@@ -177,8 +234,10 @@ do
 	pcall(tern.kv.set, "drag_state", { active = false })
 end
 
-local function ensure_drag_helper(force: boolean?)
-	if helper_running or not persisted.visible then
+-- `allow_overview`: the `Tổng quan` board draws the same rows and takes the same drags, so the
+-- helper must survive while the sidebar itself is hidden behind that tab.
+local function ensure_drag_helper(force: boolean?, allow_overview: boolean?)
+	if helper_running or not (persisted.visible or allow_overview == true) then
 		return
 	end
 	local now = tern.now()
@@ -225,7 +284,9 @@ local function live_host_canvases(cx: WindowCx): { [number]: boolean }
 	end)
 	if ok_c and type(clist) == "table" then
 		for _, c in ipairs(clist) do
-			if c.owner == tern.plugin.id then
+			-- The overview lives in its own tab and must survive every sidebar lifecycle path; the
+			-- empty-session placeholder is not a strip either.
+			if c.owner == tern.plugin.id and not is_overview_title(c.title) and not is_empty_title(c.title) then
 				map[c.pane] = true
 			end
 		end
@@ -243,7 +304,12 @@ local function owned_canvases(cx: WindowCx): { [number]: boolean }
 			-- Identity only: pane ids saved by another window's copy of this plugin must never make a
 			-- foreign pane ours (that is how a sidebar got moved or closed from the wrong window).
 			local is_canvas = (p.kind == "canvas" or p.program == "tern.canvas" or p.block == "tern.canvas" or p.block == "plugin.tern.canvas")
-			if is_canvas and (p.title == SIDEBAR_TITLE or p.title == "Canvas" or p.title == "TestRemoteCanvas") then
+			if
+				not is_empty_title(p.title)
+				and not empty_panes[p.pane]
+				and is_canvas
+				and (p.title == SIDEBAR_TITLE or p.title == "Canvas" or p.title == "TestRemoteCanvas")
+			then
 				map[p.pane] = true
 			end
 		end
@@ -327,6 +393,75 @@ local function drop_sidebar_pane(cx: WindowCx, spane: number)
 	end)
 end
 
+-- Placeholder panes: tracker, host canvases titled EMPTY_TITLE, and panes the session reports.
+local function empty_canvases(cx: WindowCx): { [number]: boolean }
+	local map: { [number]: boolean } = {}
+	for p, _ in pairs(empty_panes) do
+		map[p] = true
+	end
+	local ok_c, clist = pcall(function()
+		return cx.canvas:list()
+	end)
+	if ok_c and type(clist) == "table" then
+		for _, c in ipairs(clist) do
+			if c.owner == tern.plugin.id and is_empty_title(c.title) then
+				map[c.pane] = true
+			end
+		end
+	end
+	local ok_p, plist = pcall(function()
+		return cx.session:panes()
+	end)
+	if ok_p and type(plist) == "table" then
+		for _, p in ipairs(plist) do
+			if is_empty_title(p.title) then
+				map[p.pane] = true
+			end
+		end
+	end
+	return map
+end
+
+local function drop_empty_pane(cx: WindowCx, epane: number)
+	empty_panes[epane] = nil
+	painted_empty_fp[epane] = nil
+	opened_at_ms[epane] = nil
+	closing_internally[epane] = true
+	pcall(function()
+		cx.layout:close(epane)
+	end)
+end
+
+local function needs_empty_hydration(cx: WindowCx, epane: number): boolean
+	local opened_t = opened_at_ms[epane]
+	if opened_t and (tern.now() - opened_t) < 2.5 then
+		return true
+	end
+	local ok_p, pinfo = pcall(function()
+		return cx.session:pane(epane)
+	end)
+	if ok_p and pinfo and pinfo.title ~= EMPTY_TITLE then
+		return true
+	end
+	local ok_c, cinfo = pcall(function()
+		return cx.canvas:get(epane)
+	end)
+	return not (ok_c and cinfo and cinfo.view ~= nil)
+end
+
+-- The placeholder pane of one tab, if it still holds one.
+local function placeholder_pane_of(cx: WindowCx, tab_id: number?): number?
+	if not tab_id then
+		return nil
+	end
+	for p, _ in pairs(empty_canvases(cx)) do
+		if cx.session:tab_of(p) == tab_id then
+			return p
+		end
+	end
+	return nil
+end
+
 local function canvas_host_ready(host_id: number, tern_version: string): boolean
 	return canvas_refused[host_id] ~= tern_version
 end
@@ -382,9 +517,10 @@ local function tab_all_panes(cx: WindowCx, tab_id: number): { number }
 end
 
 local function first_user_pane(cx: WindowCx, tab_id: number, owned: { [number]: boolean }): number?
+	local empties = empty_canvases(cx)
 	local remembered = last_user_pane_by_tab[tab_id]
 	local panes = tab_all_panes(cx, tab_id)
-	if remembered and not owned[remembered] then
+	if remembered and not owned[remembered] and not empties[remembered] then
 		for _, p in ipairs(panes) do
 			if p == remembered then
 				return remembered
@@ -392,7 +528,7 @@ local function first_user_pane(cx: WindowCx, tab_id: number, owned: { [number]: 
 		end
 	end
 	for _, p in ipairs(panes) do
-		if not owned[p] then
+		if not owned[p] and not empties[p] then
 			return p
 		end
 	end
@@ -678,8 +814,12 @@ local function resolve_pane_icon(pinfo: PaneInfo, is_agent: boolean, acmd: strin
 	return "terminal"
 end
 
+-- The widget formatter has 4 ms and may only read module state, so collect_data caches these.
+local widget_counts = { total = 0, running = 0, waiting = 0 }
+
 local function collect_data(cx: WindowCx): CollectedData
 	local owned = owned_canvases(cx)
+	local empty_map = empty_canvases(cx)
 	local focused = cx.session:focused()
 
 	-- 1. Hosts
@@ -724,7 +864,13 @@ local function collect_data(cx: WindowCx): CollectedData
 	end)
 	if ok_p and type(plist) == "table" then
 		for _, p in ipairs(plist) do
-			if not owned[p.pane] and not p.parked then
+			if
+				not owned[p.pane]
+				and not empty_map[p.pane]
+				and not p.parked
+				and not is_overview_title(p.title)
+				and not is_empty_title(p.title)
+			then
 				pane_info_by_id[p.pane] = p
 				if type(p.tab) == "number" then
 					local arr = panes_by_tab_fallback[p.tab]
@@ -750,7 +896,7 @@ local function collect_data(cx: WindowCx): CollectedData
 	local active_tab_id: number? = nil
 	if focused then
 		active_tab_id = cx.session:tab_of(focused)
-		if not owned[focused] and active_tab_id then
+		if not owned[focused] and not empty_map[focused] and active_tab_id then
 			last_user_pane_by_tab[active_tab_id] = focused
 		end
 	end
@@ -866,6 +1012,10 @@ local function collect_data(cx: WindowCx): CollectedData
 		local host_name = if h and h.name ~= "" then h.name else "local"
 		local host_kind = if h and h.kind then h.kind else "local"
 		local host_state = if h and h.state then h.state else "connected"
+		-- The overview session is the board's own home, never one of its rows.
+		if s.name == OVERVIEW_SESSION and host_kind == "local" then
+			continue
+		end
 		local skey = host_name .. "::" .. s.name
 		local is_cur_sess = (s.current == true) or (active_session_id == s.id)
 		if is_cur_sess and not active_session_id then
@@ -1042,9 +1192,9 @@ local function collect_data(cx: WindowCx): CollectedData
 				tab_icon = tab_icon or (pane_entries[1] and pane_entries[1].icon) or "terminal"
 			end
 
-			-- Skip pure-sidebar transient tabs if there are other tabs in the session
-			local only_sidebar = (#pane_entries == 0 and #stabs > 1)
-			if not only_sidebar then
+			-- A tab must have a real user pane to be listed: a tab holding only the sidebar strip
+			-- and/or the empty-session placeholder is not a row, which keeps an empty session `0t`.
+			if #pane_entries > 0 then
 				table.insert(tab_entries, {
 					id = t.id,
 					session_id = s.id,
@@ -1154,6 +1304,14 @@ local function collect_data(cx: WindowCx): CollectedData
 		save_state()
 	end
 
+	widget_counts.total, widget_counts.running, widget_counts.waiting = 0, 0, 0
+	for _, g in ipairs(GROUPS) do
+		local c = group_counts[g.id]
+		widget_counts.total += c.total
+		widget_counts.running += c.running
+		widget_counts.waiting += c.waiting
+	end
+
 	return {
 		sessions = sessions,
 		by_group = by_group,
@@ -1177,6 +1335,61 @@ end
 -- A stage is drawn unless its pill is off or "hide empty" hides it while it holds no session.
 local function stage_hidden(g: GroupSpec, count: number): boolean
 	return persisted.stage_vis[g.id] == false or (persisted.hide_empty and count == 0)
+end
+
+-- A build that outgrew one timer slice continues in the next one: each pass gets a fresh 50 ms
+-- budget, so no single call trips it.
+local BUILD_SLICE_MS = 25
+local slice_start = 0
+local sliced: { [string]: { co: thread, stamp: string } } = {}
+
+local function slice()
+	if tern.now() - slice_start >= BUILD_SLICE_MS then
+		coroutine.yield()
+	end
+end
+
+-- Resumes `fn` for one slice: "yielded" when it needs another pass, else "done" plus its returns.
+-- A different `stamp` replaces the pending build, whose data is stale.
+local function run_sliced(lane: string, stamp: string, fn: () -> ...any): (string, ...any)
+	local job = sliced[lane]
+	if job and job.stamp ~= stamp then
+		job = nil
+	end
+	if not job then
+		job = { co = coroutine.create(fn), stamp = stamp }
+		sliced[lane] = job
+	end
+	slice_start = tern.now()
+	local ok, a, b, c = coroutine.resume(job.co)
+	if not ok then
+		sliced[lane] = nil
+		error(a, 0)
+	end
+	if coroutine.status(job.co) ~= "dead" then
+		return "yielded"
+	end
+	sliced[lane] = nil
+	return "done", a, b, c
+end
+
+-- A tree built by one hook is painted by the next: a build plus a paint of that same tree in a
+-- single 50 ms hook is what still went over. A newer fingerprint replaces the pending tree.
+local deferred: { fp: string, view: any, dock: any, sections: any }? = nil
+
+-- One pending resume per lane: a second timer would only rebuild what the first one resumes.
+local wake_scheduled: { [string]: boolean } = {}
+local function wake(cx: WindowCx, lane: string, fn: (WindowCx) -> ())
+	if wake_scheduled[lane] then
+		return
+	end
+	wake_scheduled[lane] = true
+	tern.timer(0, function(tcx: WindowCx?)
+		wake_scheduled[lane] = nil
+		if tcx and not busy_lock and (persisted.visible or current_is_overview(tcx)) then
+			fn(tcx)
+		end
+	end)
 end
 
 -- Returns the whole-view fingerprint plus one fingerprint per direct child of `sidebar2_root`,
@@ -1347,11 +1560,119 @@ local function status_icon_node(key: string, st: ItemStatus): Node?
 	return nil
 end
 
+-- The sidebar and the `Tổng quan` board draw the same rows, so both read their popup menus from
+-- here: an entry added once shows up on either surface and can never act differently.
+local function build_session_menu(
+	sess: SessionEntry,
+	group: GroupId,
+	group_count: number,
+	is_picked: boolean
+): { any }
+	local menu: { any } = {
+		{ header = sess.host_name .. " · " .. sess.name },
+		{ id = "new_tab_in=" .. tostring(sess.id), label = "New Tab", icon = "plus" },
+		{ id = "new_omp_in=" .. tostring(sess.id), label = "New Tab omp", icon = "open" },
+		"-",
+		{ id = "focus_sess=" .. tostring(sess.id), label = "Focus Session", icon = "open" },
+		{ id = "rename_sess=" .. tostring(sess.id), label = "Rename Session…", icon = "pen" },
+		"-",
+		{ header = "Kanban Stage" },
+	}
+	for _, gspec in ipairs(GROUPS) do
+		table.insert(menu, {
+			id = "move_group=" .. gspec.id .. ":" .. sess.skey,
+			label = "Move to " .. gspec.label,
+			icon = gspec.icon,
+			radio = "stage",
+			checked = (sess.group == gspec.id),
+		})
+	end
+	table.insert(menu, "-")
+	table.insert(menu, {
+		id = "pick=" .. sess.skey,
+		label = if is_picked then "Cancel Pick Session" else "Pick Session",
+		icon = "grip",
+	})
+	if group_count >= 2 then
+		if sess.pos > 1 then
+			table.insert(menu, {
+				id = "sess_move=" .. group .. ":" .. tostring(sess.pos - 1) .. ":" .. sess.skey,
+				label = "Move Session Up",
+				icon = "arrow-up",
+			})
+		end
+		if sess.pos < group_count then
+			table.insert(menu, {
+				id = "sess_move=" .. group .. ":" .. tostring(sess.pos + 1) .. ":" .. sess.skey,
+				label = "Move Session Down",
+				icon = "arrow-down",
+			})
+		end
+	end
+	return menu
+end
+
+local function build_tab_menu(
+	sess: SessionEntry,
+	tab: TabEntry,
+	can_reorder_tabs: boolean,
+	is_tab_picked: boolean,
+	t_marked: boolean
+): { any }
+	local tkey = tostring(tab.id)
+	local menu: { any } = {
+		{ header = "#" .. tostring(tab.pos) .. " " .. tab.title },
+		{ id = "new_tab_in=" .. tostring(sess.id) .. ":" .. tkey, label = "New Tab", icon = "plus" },
+		{ id = "new_omp_in=" .. tostring(sess.id) .. ":" .. tkey, label = "New Tab omp", icon = "open" },
+		{
+			id = "close_tab=" .. tostring(sess.id) .. ":" .. tkey,
+			label = "Close Tab",
+			icon = "trash",
+			danger = true,
+		},
+		"-",
+		{
+			id = "mark_tab=" .. tkey,
+			label = if t_marked then "Bỏ đánh dấu" else "Đánh dấu cần đọc",
+			icon = if t_marked then "check" else "eye",
+		},
+		"-",
+		{ id = "focus_tab=" .. tostring(sess.id) .. ":" .. tkey, label = "Focus Tab", icon = "open" },
+		{ id = "rename_tab=" .. tkey, label = "Rename Tab…", icon = "pen" },
+	}
+	if can_reorder_tabs then
+		table.insert(menu, "-")
+		table.insert(menu, {
+			id = "pick_tab=" .. tostring(sess.id) .. ":" .. tkey,
+			label = if is_tab_picked then "Cancel Pick Tab" else "Pick Tab",
+			icon = "grip",
+		})
+		if tab.pos > 1 then
+			table.insert(menu, {
+				id = "tab_move=" .. tkey .. ":" .. tostring(tab.pos - 1),
+				label = "Move Tab Up",
+				icon = "arrow-up",
+			})
+		end
+		if tab.pos < #sess.tabs then
+			table.insert(menu, {
+				id = "tab_move=" .. tkey .. ":" .. tostring(tab.pos + 1),
+				label = "Move Tab Down",
+				icon = "arrow-down",
+			})
+		end
+	end
+	return menu
+end
+
 local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
+	publish_surface("sidebar")
 	local root_children: { Node } = {}
 	local picked_sess_entry = if picked_skey then data.by_skey[picked_skey] else nil
 	local dom_level1: { DomLevel1 } = {}
 	local dom_level2: { DomLevel2 } = {}
+	-- Stage ids in paint order: drag_helper pairs them with the `ctl tree` column rects.
+	local dom_groups: { string } = {}
 	local dom_fp_parts: { string } = { persisted.side, tostring(badge_cfg_open) }
 	-- 1. Top Toolbar
 	local toolbar = ui.node("row", {
@@ -1367,6 +1688,21 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 			}),
 		}),
 		ui.row({
+			ui.button("", {
+				key = "btn_overview",
+				icon = "eye",
+				size = "sm",
+				variant = "quiet",
+				title = "Mở Tổng quan (tab trên PC này)",
+				actions = {
+					click = "open_overview",
+					menu = {
+						{ header = "Tổng quan" },
+						{ id = "open_overview", label = "Mở / Focus Tổng quan", icon = "eye" },
+						{ id = "refresh_overview", label = "Làm mới", icon = "repeat" },
+					},
+				},
+			}),
 			ui.button(if persisted.side == "left" then "R" else "L", {
 				key = "btn_side",
 				icon = if persisted.side == "left" then "dock-right" else "dock-left",
@@ -1406,10 +1742,12 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 
 	-- 3. Kanban Groups: one column per stage
 	for _, g in ipairs(GROUPS) do
+		slice()
 		local g_entries = data.by_group[g.id] or {}
 		if stage_hidden(g, #g_entries) then
 			continue
 		end
+		table.insert(dom_groups, g.id)
 		local g_folded = persisted.fold_groups[g.id] == true
 		local g_chev = if g_folded then "▸" else "▾"
 		local group_children: { Node } = {}
@@ -1535,6 +1873,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 				)
 			else
 				for _, sess in ipairs(g_entries) do
+					slice()
 					local s_folded = persisted.fold_sessions[sess.skey] == true
 					local s_chev = if s_folded then "▸" else "▾"
 					local is_picked = (picked_skey == sess.skey)
@@ -1570,47 +1909,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 					local host_badge_tone = if sess.host_kind == "remote" then "info" else "neutral"
 					local sess_st_node = status_icon_node("st_s_" .. sess.skey, sess.status)
 
-					local l1_menu: { any } = {
-						{ header = sess.host_name .. " · " .. sess.name },
-						{ id = "new_tab_in=" .. tostring(sess.id), label = "New Tab", icon = "plus" },
-						{ id = "new_omp_in=" .. tostring(sess.id), label = "New Tab omp", icon = "open" },
-						"-",
-						{ id = "focus_sess=" .. tostring(sess.id), label = "Focus Session", icon = "open" },
-						{ id = "rename_sess=" .. tostring(sess.id), label = "Rename Session…", icon = "pen" },
-						"-",
-						{ header = "Kanban Stage" },
-					}
-					for _, gspec in ipairs(GROUPS) do
-						table.insert(l1_menu, {
-							id = "move_group=" .. gspec.id .. ":" .. sess.skey,
-							label = "Move to " .. gspec.label,
-							icon = gspec.icon,
-							radio = "stage",
-							checked = (sess.group == gspec.id),
-						})
-					end
-					table.insert(l1_menu, "-")
-					table.insert(l1_menu, {
-						id = "pick=" .. sess.skey,
-						label = if is_picked then "Cancel Pick Session" else "Pick Session",
-						icon = "grip",
-					})
-					if can_reorder_sess then
-						if sess.pos > 1 then
-							table.insert(l1_menu, {
-								id = "sess_move=" .. g.id .. ":" .. tostring(sess.pos - 1) .. ":" .. sess.skey,
-								label = "Move Session Up",
-								icon = "arrow-up",
-							})
-						end
-						if sess.pos < #g_entries then
-							table.insert(l1_menu, {
-								id = "sess_move=" .. g.id .. ":" .. tostring(sess.pos + 1) .. ":" .. sess.skey,
-								label = "Move Session Down",
-								icon = "arrow-down",
-							})
-						end
-					end
+					local l1_menu = build_session_menu(sess, g.id, #g_entries, is_picked)
 					table.insert(dom_level1, {
 						skey = sess.skey,
 						sess_id = sess.id,
@@ -1753,52 +2052,7 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 									.. tostring(if has_sub and not t_folded then #tab.panes else 0)
 							)
 
-							local l2_menu: { any } = {
-								{ header = "#" .. tostring(tab.pos) .. " " .. tab.title },
-								{ id = "new_tab_in=" .. tostring(sess.id) .. ":" .. tkey, label = "New Tab", icon = "plus" },
-								{ id = "new_omp_in=" .. tostring(sess.id) .. ":" .. tkey, label = "New Tab omp", icon = "open" },
-								{
-									id = "close_tab=" .. tostring(sess.id) .. ":" .. tkey,
-									label = "Close Tab",
-									icon = "trash",
-									danger = true,
-								},
-								"-",
-								{
-									id = "mark_tab=" .. tkey,
-									label = if t_marked then "Bỏ đánh dấu" else "Đánh dấu cần đọc",
-									icon = if t_marked then "check" else "eye",
-								},
-								"-",
-								{
-									id = "focus_tab=" .. tostring(sess.id) .. ":" .. tkey,
-									label = "Focus Tab",
-									icon = "open",
-								},
-								{ id = "rename_tab=" .. tkey, label = "Rename Tab…", icon = "pen" },
-							}
-							if can_reorder_tabs then
-								table.insert(l2_menu, "-")
-								table.insert(l2_menu, {
-									id = "pick_tab=" .. tostring(sess.id) .. ":" .. tkey,
-									label = if is_tab_picked then "Cancel Pick Tab" else "Pick Tab",
-									icon = "grip",
-								})
-								if tab.pos > 1 then
-									table.insert(l2_menu, {
-										id = "tab_move=" .. tkey .. ":" .. tostring(tab.pos - 1),
-										label = "Move Tab Up",
-										icon = "arrow-up",
-									})
-								end
-								if tab.pos < #sess.tabs then
-									table.insert(l2_menu, {
-										id = "tab_move=" .. tkey .. ":" .. tostring(tab.pos + 1),
-										label = "Move Tab Down",
-										icon = "arrow-down",
-									})
-								end
-							end
+							local l2_menu = build_tab_menu(sess, tab, can_reorder_tabs, is_tab_picked, t_marked)
 
 							local l2_children: { Node } = {}
 							if can_reorder_tabs then
@@ -2000,8 +2254,10 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 			dom_map_seq += 1
 			pcall(tern.kv.set, "dom_map", {
 				seq = dom_map_seq,
+				surface = "sidebar",
 				side = persisted.side,
 				active_pane = data.focused_pane,
+				groups = tern.json.array(dom_groups),
 				level1 = tern.json.array(dom_level1),
 				level2 = tern.json.array(dom_level2),
 			})
@@ -2201,8 +2457,698 @@ local function build_view(data: CollectedData): (Node, Node, { [string]: Node })
 end
 
 -- ---------------------------------------------------------------------------
+-- Overview Views (read-only board of every session + the agents waiting for the user)
+-- ---------------------------------------------------------------------------
+local function overview_waiting_count(data: CollectedData): number
+	local n = 0
+	for _, s in ipairs(data.sessions) do
+		for _, t in ipairs(s.tabs) do
+			for _, p in ipairs(t.panes) do
+				-- Blocked, or finished and still unseen: both want the user.
+				if p.waiting or p.status == "unread" then
+					n += 1
+				end
+			end
+		end
+	end
+	return n
+end
+
+local function build_overview_board(data: CollectedData): Node
+	publish_surface("overview")
+	local picked_sess_entry = if picked_skey then data.by_skey[picked_skey] else nil
+	-- Same DOM map the sidebar publishes: drag_helper reads it to place the drop zones.
+	local ov_dom_groups: { string } = {}
+	local ov_dom_level1: { DomLevel1 } = {}
+	local ov_dom_level2: { DomLevel2 } = {}
+	local ov_dom_fp_parts: { string } = {}
+	local children: { Node } = {
+		ui.node("row", {
+			key = "ov_head",
+			role = "sidebar2.ov.head",
+			justify = "between",
+			align = "center",
+		}, {
+			ui.text({
+				ui.span("TỔNG QUAN", "strong"),
+				ui.span(
+					" · " .. tostring(#data.sessions) .. " sessions · " .. tostring(overview_waiting_count(data)) .. " chờ",
+					"muted"
+				),
+			}),
+			ui.node("row", { key = "ov_head_btns", align = "center" }, {
+				ui.button("Session", {
+					key = "ov_new_sess",
+					icon = "plus",
+					size = "sm",
+					variant = "default",
+					title = "Tạo session mới",
+					actions = { click = "new_session" },
+				}),
+				ui.button("Move…", {
+					key = "ov_move_sess",
+					icon = "kanban",
+					size = "sm",
+					variant = "quiet",
+					title = "Chuyển session sang trạng thái khác",
+					actions = { click = "move_modal" },
+				}),
+				ui.button("", {
+					key = "ov_refresh",
+					icon = "repeat",
+					size = "sm",
+					variant = "quiet",
+					title = "Làm mới Tổng quan",
+					actions = { click = "refresh_overview" },
+				}),
+			}),
+		}),
+	}
+
+	local stages: { Node } = {}
+	for _, g in ipairs(GROUPS) do
+		slice()
+		local g_entries = data.by_group[g.id] or {}
+		-- Ids in paint order: drag_helper pairs them with the `ctl tree` column rects.
+		table.insert(ov_dom_groups, g.id)
+		local is_group_drop_target = (picked_skey ~= nil and (hover_group == g.id or hover_group == nil))
+		local head_right: { Node } = {}
+		if is_group_drop_target then
+			-- The whole head is the drop zone, so the badge only has to say so.
+			table.insert(
+				head_right,
+				ui.node("badge", {
+					key = "ov_drop_g_" .. g.id,
+					text = "↓ Drop here",
+					tone = "info",
+					actions = { click = "drop_group=" .. g.id },
+				})
+			)
+		end
+		table.insert(head_right, ui.text({ ui.span(tostring(#g_entries), "muted") }))
+		local stage_children: { Node } = {
+			ui.node("row", {
+				key = "ov_sh_" .. g.id,
+				role = "sidebar2.ov.stage_head",
+				justify = "between",
+				align = "center",
+				actions = {
+					click = if picked_skey then ("drop_group=" .. g.id) else nil,
+					menu = {
+						{ header = g.label },
+						{ id = "new_session_in=" .. g.id, label = "New Session", icon = "plus" },
+					},
+				},
+			}, {
+				ui.text({ ui.span(g.label, "strong") }),
+				ui.node("row", { key = "ov_shr_" .. g.id, align = "center" }, head_right),
+			}),
+		}
+
+		for _, sess in ipairs(g_entries) do
+			slice()
+			local running, sess_waiting = 0, 0
+			for _, tab in ipairs(sess.tabs) do
+				for _, p in ipairs(tab.panes) do
+					if p.is_agent then
+						if p.busy then
+							running += 1
+						elseif p.waiting then
+							sess_waiting += 1
+						end
+					end
+				end
+			end
+			local sid = tostring(sess.id)
+			local is_picked = (picked_skey == sess.skey)
+			local is_same_group_drag = (picked_sess_entry ~= nil and picked_sess_entry.group == g.id)
+			-- Moving into another stage can append past the last row (`N + 1`), which no row of
+			-- its own represents; the last row carries that mark instead.
+			local is_append_after_last = (
+				not is_same_group_drag
+				and picked_skey ~= nil
+				and hover_group == g.id
+				and hover_sess_pos ~= nil
+				and hover_sess_pos > #g_entries
+				and sess.pos == #g_entries
+			)
+			local is_sess_drop_target = (
+				picked_skey ~= nil
+				and picked_skey ~= sess.skey
+				and (hover_group == nil or hover_group == g.id)
+				and (hover_sess_pos == nil or hover_sess_pos == sess.pos or is_append_after_last)
+			)
+			local effective_drop_pos = if is_append_after_last then (#g_entries + 1) else sess.pos
+			local drop_sess_act = "drop_sess=" .. g.id .. ":" .. tostring(effective_drop_pos)
+			local sess_drop_mark = if not is_sess_drop_target or hover_group ~= g.id or hover_sess_pos == nil
+				then nil
+				elseif is_append_after_last
+					or (is_same_group_drag and picked_sess_entry and sess.pos > picked_sess_entry.pos)
+					then "drop_after"
+				else "drop_before"
+			local l1_menu = build_session_menu(sess, g.id, #g_entries, is_picked)
+			table.insert(ov_dom_level1, {
+				skey = sess.skey,
+				sess_id = sess.id,
+				group = g.id,
+				name = sess.name,
+				pos = sess.pos,
+				group_count = #g_entries,
+			})
+			table.insert(ov_dom_fp_parts, "L1:" .. sess.skey .. ":" .. g.id .. ":" .. tostring(sess.pos))
+
+			local right: { Node } = {}
+			if running > 0 then
+				table.insert(right, ui.badge("✦" .. tostring(running), "warning"))
+			end
+			if sess_waiting > 0 then
+				table.insert(right, ui.badge("✦" .. tostring(sess_waiting), "error"))
+			end
+			if is_sess_drop_target then
+				table.insert(
+					right,
+					ui.node("badge", {
+						key = "ov_drop_s_" .. sess.skey,
+						text = "↕ #" .. tostring(effective_drop_pos),
+						tone = "info",
+						actions = { click = drop_sess_act },
+					})
+				)
+			else
+				table.insert(
+					right,
+					ui.button("", {
+						key = "ov_newtab_" .. sid,
+						icon = "plus",
+						size = "sm",
+						variant = "quiet",
+						title = "Tạo tab mới trong " .. sess.name .. " (Chuột phải: thêm tùy chọn)",
+						actions = {
+							click = "new_tab_in=" .. sid,
+							menu = {
+								{ header = sess.host_name .. " · " .. sess.name },
+								{ id = "new_tab_in=" .. sid, label = "New Tab", icon = "plus" },
+								{ id = "new_omp_in=" .. sid, label = "New Tab omp", icon = "open" },
+							},
+						},
+					})
+				)
+			end
+			local card_act = if is_sess_drop_target then drop_sess_act else ("focus_sess=" .. sid)
+
+			table.insert(stage_children, ui.node("row", {
+				key = "ov_c_" .. sid,
+				role = if sess.current then "sidebar2.ov.card.current" else "sidebar2.ov.card",
+				mark = if is_picked then "pick" else sess_drop_mark,
+				justify = "between",
+				align = "center",
+				title = sess.host_name .. " · " .. sess.name,
+				actions = { click = card_act, menu = l1_menu },
+			}, {
+				ui.node("row", { key = "ov_cl_" .. sid, align = "center" }, {
+					ui.node("badge", {
+						key = "ov_pick_s_" .. sess.skey,
+						role = "sidebar2.grip1",
+						text = if is_picked then "🎯" elseif is_sess_drop_target then "↕" else "⠿",
+						tone = if is_picked
+							then "warning"
+							elseif is_sess_drop_target then "info"
+							else "neutral",
+						actions = {
+							click = if is_sess_drop_target then drop_sess_act else ("pick=" .. sess.skey),
+							menu = l1_menu,
+						},
+					}),
+					ui.node("row", {
+						key = "ov_clt_" .. sid,
+						role = "sidebar2.l1_title",
+						align = "center",
+						title = sess.host_name
+							.. " · "
+							.. sess.name
+							.. " ("
+							.. tostring(#sess.tabs)
+							.. " tabs)",
+						actions = { click = card_act, menu = l1_menu },
+					}, {
+						ui.badge(sess.host_name, if sess.host_kind == "remote" then "info" else "neutral"),
+						ui.text({
+							ui.span(short_text(sess.name, 22), if sess.current then "strong" else nil),
+							ui.span(" " .. tostring(#sess.tabs) .. "t", "muted"),
+						}),
+					}),
+				}),
+				ui.node("row", {
+					key = "ov_cr_" .. sid,
+					role = "sidebar2.right_icons",
+					align = "center",
+				}, right),
+			}))
+
+			local can_reorder_tabs = #sess.tabs >= 2
+			local picked_tab_pos: number? = nil
+			if picked_tab_sess == sess.id then
+				for _, pt in ipairs(sess.tabs) do
+					if pt.id == picked_tab_id then
+						picked_tab_pos = pt.pos
+						break
+					end
+				end
+			end
+			for _, tab in ipairs(sess.tabs) do
+				local tid = tostring(tab.id)
+				local t_marked = persisted.marked_tabs[tid] == true
+				local is_tab_picked = (picked_tab_id == tab.id)
+				local is_tab_drop_target = (
+					picked_tab_id ~= nil
+					and picked_tab_sess == sess.id
+					and picked_tab_id ~= tab.id
+					and (hover_tab_pos == nil or hover_tab_pos == tab.pos)
+				)
+				local tab_drop_mark = if not is_tab_drop_target or hover_tab_pos == nil
+					then nil
+					elseif picked_tab_pos and tab.pos > picked_tab_pos then "drop_after"
+					else "drop_before"
+				local l2_menu = build_tab_menu(sess, tab, can_reorder_tabs, is_tab_picked, t_marked)
+				local drop_tab_act = "drop_tab=" .. tostring(tab.pos)
+				local tab_act = if is_tab_drop_target then drop_tab_act else ("focus_tab=" .. sid .. ":" .. tid)
+				table.insert(ov_dom_level2, {
+					tab_id = tab.id,
+					sess_id = sess.id,
+					pos = tab.pos,
+					title = tab.title,
+					tab_count = #sess.tabs,
+					has_sub = false,
+				})
+				table.insert(ov_dom_fp_parts, "L2:" .. tid .. ":" .. tostring(tab.pos) .. ":" .. tostring(t_marked))
+
+				local tab_children: { Node } = {}
+				if can_reorder_tabs then
+					table.insert(
+						tab_children,
+						ui.node("badge", {
+							key = "ov_pick_t_" .. tid,
+							role = "sidebar2.grip2",
+							text = if is_tab_picked then "🎯" elseif is_tab_drop_target then "↕" else "⠿",
+							tone = if is_tab_picked
+								then "warning"
+								elseif is_tab_drop_target then "info"
+								else "neutral",
+							actions = {
+								click = if is_tab_drop_target
+									then drop_tab_act
+									else ("pick_tab=" .. sid .. ":" .. tid),
+								menu = l2_menu,
+							},
+						})
+					)
+				end
+				table.insert(
+					tab_children,
+					ui.node("row", {
+						key = "ov_tl_" .. tid,
+						role = "sidebar2.l2_title",
+						align = "center",
+						gap = "xs",
+						title = sess.host_name
+							.. " · "
+							.. sess.name
+							.. " · #"
+							.. tostring(tab.pos)
+							.. " "
+							.. tab.title,
+						actions = { click = tab_act, menu = l2_menu },
+					}, {
+						ui.node("icon", {
+							name = tab.icon,
+							tone = if tab.status == "waiting"
+								then "error"
+								elseif tab.current then "accent"
+								else "neutral",
+						}),
+						ui.text({
+							ui.span("#" .. tostring(tab.pos) .. " ", "muted"),
+							ui.span(short_text(tab.title, 26), if tab.current then "strong" else nil),
+						}),
+					})
+				)
+				if t_marked then
+					table.insert(
+						tab_children,
+						ui.node("badge", {
+							key = "ov_mark_t_" .. tid,
+							role = "sidebar2.tab_mark",
+							text = "⚑",
+							tone = "error",
+							title = "Tab cần đọc (Click hoặc chuột phải để bỏ đánh dấu)",
+							actions = { click = "mark_tab=" .. tid, menu = l2_menu },
+						})
+					)
+				end
+				local st = status_icon_node("ov_st_" .. tid, tab.status)
+				if st then
+					table.insert(tab_children, st)
+				end
+				table.insert(stage_children, ui.node("row", {
+					key = "ov_t_" .. tid,
+					role = if tab.current then "sidebar2.ov.tab.current" else "sidebar2.ov.tab",
+					mark = if is_tab_picked then "pick" else tab_drop_mark,
+					justify = "between",
+					align = "center",
+					title = sess.host_name .. " · " .. sess.name .. " · #" .. tostring(tab.pos) .. " " .. tab.title,
+					actions = { click = tab_act, menu = l2_menu },
+				}, tab_children))
+			end
+		end
+
+		if #g_entries == 0 then
+			local is_empty_drop = (picked_skey ~= nil and hover_group == g.id)
+			table.insert(stage_children, ui.node("row", {
+				key = "ov_e_" .. g.id,
+				role = "sidebar2.ov.empty",
+				mark = if is_empty_drop then "drop_target" else nil,
+				actions = if picked_skey ~= nil then { click = "drop_sess=" .. g.id .. ":1" } else nil,
+			}, {
+				ui.text({ ui.span(if is_empty_drop then "↓ Drop here" else "—", "muted") }),
+			}))
+		end
+
+		table.insert(stages, ui.node("col", {
+			key = "ov_g_" .. g.id,
+			role = "sidebar2.ov.stage." .. g.id,
+		}, stage_children))
+	end
+
+	-- Only publish while nothing is being dragged: a pick frame carries a transient mark, and a
+	-- map written mid-drag would move the hit zones under the cursor.
+	if not picked_skey and not picked_tab_id then
+		local ov_map_fp = table.concat(ov_dom_fp_parts, "|")
+		if ov_map_fp ~= last_ov_dom_map_fp then
+			last_ov_dom_map_fp = ov_map_fp
+			dom_map_seq += 1
+			pcall(tern.kv.set, "ov_dom_map", {
+				seq = dom_map_seq,
+				surface = "overview",
+				groups = tern.json.array(ov_dom_groups),
+				level1 = tern.json.array(ov_dom_level1),
+				level2 = tern.json.array(ov_dom_level2),
+			})
+		end
+	end
+
+	table.insert(children, ui.node("row", { key = "ov_board", role = "sidebar2.ov.board" }, stages))
+	return ui.node("col", { key = "ov_root", role = "sidebar2.ov.root" }, children)
+end
+
+-- One row per agent that needs the user: a blocked one, or one that finished unread.
+local function overview_wait_row(
+	sess: SessionEntry,
+	tab: TabEntry,
+	pane: PaneEntry,
+	why: string,
+	kind: "waiting" | "unread",
+	plan: boolean
+): Node
+	local pid = tostring(pane.id)
+	local tone = if kind == "unread" then "success" else "error"
+	local why_tone = if kind == "unread" then "success" elseif plan then "warning" else "error"
+	local meta = sess.host_name .. " · " .. sess.name .. " · #" .. tostring(tab.pos) .. " " .. tab.title
+	return ui.node("row", {
+		key = "ov_w_" .. pid,
+		role = "sidebar2.ov.wait",
+		justify = "between",
+		align = "center",
+		title = meta .. " · " .. why,
+		actions = { click = "focus_pane=" .. tostring(sess.id) .. ":" .. tostring(tab.id) .. ":" .. pid },
+	}, {
+		ui.node("row", {
+			key = "ov_wl_" .. pid,
+			grow = 1,
+			align = "center",
+			gap = "xs",
+		}, {
+			ui.node("badge", {
+				text = "✦",
+				tone = tone,
+				role = "sidebar2.status." .. kind,
+			}),
+			ui.node("icon", { name = pane.icon, tone = tone }),
+			ui.node("col", { key = "ov_wc_" .. pid }, {
+				ui.text({
+					ui.span(pane.title, "strong"),
+					ui.span(" · " .. why, why_tone),
+				}),
+				ui.text({ ui.span(meta, "muted") }),
+			}),
+		}),
+	})
+end
+
+-- One row per tab the user flagged: a jump target that can drop its own flag.
+local function overview_marked_row(sess: SessionEntry, tab: TabEntry): Node
+	local tid = tostring(tab.id)
+	local sid = tostring(sess.id)
+	local stage_label = if GROUP_BY_ID[sess.group] then GROUP_BY_ID[sess.group].label else sess.group
+	local meta = sess.host_name .. " · " .. sess.name .. " · " .. stage_label
+	local l2_menu = build_tab_menu(sess, tab, false, false, true)
+	local icon_tone = if tab.status == "waiting"
+		then "error"
+		elseif tab.current then "accent"
+		elseif tab.has_agent then "info"
+		else "neutral"
+	local row_children: { Node } = {
+		ui.node("row", {
+			key = "ov_wml_" .. tid,
+			grow = 1,
+			align = "center",
+			gap = "xs",
+		}, {
+			ui.node("badge", {
+				key = "ov_wm_flag_" .. tid,
+				role = "sidebar2.tab_mark",
+				text = "⚑",
+				tone = "error",
+				title = "Tab cần đọc (Click hoặc chuột phải để bỏ đánh dấu)",
+				actions = { click = "mark_tab=" .. tid, menu = l2_menu },
+			}),
+			ui.node("icon", { name = tab.icon, tone = icon_tone }),
+			ui.node("col", { key = "ov_wmc_" .. tid }, {
+				ui.text({
+					ui.span("#" .. tostring(tab.pos) .. " " .. tab.title, "strong"),
+					ui.span(" · đang đánh dấu", "error"),
+				}),
+				ui.text({ ui.span(meta, "muted") }),
+			}),
+		}),
+	}
+	local st = status_icon_node("ov_wm_st_" .. tid, tab.status)
+	if st then
+		table.insert(row_children, st)
+	end
+	return ui.node("row", {
+		key = "ov_wm_" .. tid,
+		role = "sidebar2.ov.wait",
+		justify = "between",
+		align = "center",
+		title = meta .. " · #" .. tostring(tab.pos) .. " " .. tab.title,
+		actions = { click = "focus_tab=" .. sid .. ":" .. tid, menu = l2_menu },
+	}, row_children)
+end
+
+-- A section always draws, so its header count never lies about a group it hides.
+local function overview_empty_row(key: string, msg: string): Node
+	return ui.node("row", { key = key, role = "sidebar2.ov.empty" }, {
+		ui.text({ ui.span(msg, "muted") }),
+	})
+end
+
+local function overview_section_head(key: string, label: string, count: number): Node
+	return ui.node("row", {
+		key = key,
+		role = "sidebar2.ov.head",
+		justify = "between",
+		align = "center",
+	}, {
+		ui.text({
+			ui.span(label, "strong"),
+			ui.span(" · " .. tostring(count), "muted"),
+		}),
+	})
+end
+
+local function build_overview_waiting(data: CollectedData): Node
+	local waiting_rows: { Node } = {}
+	local unread_rows: { Node } = {}
+	local marked_rows: { Node } = {}
+	for _, sess in ipairs(data.sessions) do
+		slice()
+		for _, tab in ipairs(sess.tabs) do
+			for _, pane in ipairs(tab.panes) do
+				if pane.waiting then
+					local plan = plan_pending[pane.id] == true
+					local why = if plan then "chờ duyệt plan" else "chờ trả lời"
+					table.insert(waiting_rows, overview_wait_row(sess, tab, pane, why, "waiting", plan))
+				elseif pane.status == "unread" then
+					table.insert(unread_rows, overview_wait_row(sess, tab, pane, "làm xong · chưa xem", "unread", false))
+				end
+			end
+			if persisted.marked_tabs[tostring(tab.id)] == true then
+				table.insert(marked_rows, overview_marked_row(sess, tab))
+			end
+		end
+	end
+
+	local children: { Node } = {
+		ui.node("row", {
+			key = "ov_whead",
+			role = "sidebar2.ov.head",
+			justify = "between",
+			align = "center",
+		}, {
+			ui.text({
+				ui.span("AGENT ĐANG CHỜ", "strong"),
+				ui.span(" · " .. tostring(#waiting_rows), "muted"),
+			}),
+			ui.button("", {
+				key = "ov_wrefresh",
+				icon = "repeat",
+				size = "sm",
+				variant = "quiet",
+				title = "Làm mới danh sách",
+				actions = { click = "refresh_overview" },
+			}),
+		}),
+	}
+	if #waiting_rows == 0 then
+		table.insert(children, overview_empty_row("ov_wempty", "Không có agent nào đang chờ"))
+	end
+	for _, r in ipairs(waiting_rows) do
+		table.insert(children, r)
+	end
+	table.insert(children, overview_section_head("ov_whead2", "AI AGENT CHƯA XEM", #unread_rows))
+	if #unread_rows == 0 then
+		table.insert(children, overview_empty_row("ov_wuempty", "Không có agent nào chưa xem"))
+	end
+	for _, r in ipairs(unread_rows) do
+		table.insert(children, r)
+	end
+	table.insert(children, overview_section_head("ov_whead3", "TAB - AI AGENT ĐANG ĐÁNH DẤU", #marked_rows))
+	if #marked_rows == 0 then
+		table.insert(children, overview_empty_row("ov_wmempty", "Không có tab nào đang đánh dấu"))
+	end
+	for _, r in ipairs(marked_rows) do
+		table.insert(children, r)
+	end
+	return ui.node("col", { key = "ov_wait_root", role = "sidebar2.ov.wait_root" }, children)
+end
+
+-- Paint keys: only what each view actually draws, so an unrelated change repaints nothing.
+local function overview_board_key(data: CollectedData): string
+	-- Everything a pick, hover or drop can change must be here, or the board would keep drawing
+	-- the anchor lines of a drag the user already ended.
+	local parts: { string } = {
+		tostring(picked_skey or ""),
+		tostring(hover_group or ""),
+		tostring(hover_sess_pos or ""),
+		tostring(picked_tab_id or ""),
+		tostring(hover_tab_pos or ""),
+	}
+	for _, s in ipairs(data.sessions) do
+		table.insert(parts, tostring(s.id))
+		table.insert(parts, s.group)
+		table.insert(parts, tostring(s.current))
+		table.insert(parts, s.host_name)
+		table.insert(parts, s.name)
+		table.insert(parts, tostring(s.pos))
+		for _, t in ipairs(s.tabs) do
+			table.insert(parts, tostring(t.id))
+			table.insert(parts, tostring(t.pos))
+			table.insert(parts, t.title)
+			table.insert(parts, t.status)
+			table.insert(parts, tostring(persisted.marked_tabs[tostring(t.id)] == true))
+			for _, p in ipairs(t.panes) do
+				table.insert(parts, tostring(p.id))
+				table.insert(parts, tostring(p.is_agent))
+				table.insert(parts, tostring(p.busy))
+				table.insert(parts, tostring(p.waiting))
+			end
+		end
+	end
+	return table.concat(parts, "|")
+end
+
+local function overview_wait_key(data: CollectedData): string
+	local parts: { string } = {}
+	for _, s in ipairs(data.sessions) do
+		for _, t in ipairs(s.tabs) do
+			for _, p in ipairs(t.panes) do
+				if p.waiting or p.status == "unread" then
+					table.insert(parts, tostring(p.id))
+					table.insert(parts, p.status)
+					table.insert(parts, tostring(plan_pending[p.id] == true))
+					table.insert(parts, p.title)
+				end
+			end
+			if persisted.marked_tabs[tostring(t.id)] == true then
+				table.insert(
+					parts,
+					table.concat({
+						"M",
+						tostring(s.id),
+						s.host_name,
+						s.name,
+						s.group,
+						tostring(t.id),
+						tostring(t.pos),
+						t.title,
+						t.icon,
+						t.status,
+						tostring(t.current),
+						tostring(t.has_agent),
+					}, ":")
+				)
+			end
+		end
+	end
+	return table.concat(parts, "|")
+end
+
+-- ---------------------------------------------------------------------------
 -- Fixed Sidebar Layout Engine (Per-Host Canvas + Ratio Sync + Refocus)
 -- ---------------------------------------------------------------------------
+-- The pane a session with no user pane shows instead of being left behind: one centered button.
+local function build_empty_session_view(sess_id: number?, sess_name: string?): Node
+	local act = if sess_id then ("new_pane_empty=" .. tostring(sess_id)) else "new_pane_empty"
+	return ui.node("col", {
+		key = "empty_sess_root",
+		role = "sidebar2.empty_sess.root",
+	}, {
+		ui.node("col", {
+			key = "empty_sess_box",
+			role = "sidebar2.empty_sess.box",
+			align = "center",
+		}, {
+			ui.text({ ui.span("Không có pane", "strong") }),
+			ui.text({
+				ui.span(
+					if sess_name and sess_name ~= ""
+						then ("Session " .. sess_name .. " chưa có pane nào")
+						else "Session này chưa có pane nào",
+					"muted"
+				),
+			}),
+			ui.button("Tạo pane", {
+				key = "btn_new_pane_empty",
+				icon = "plus",
+				variant = "primary",
+				size = "md",
+				title = "Tạo pane mới trong session này",
+				actions = { click = act },
+			}),
+		}),
+	})
+end
+
 local function close_all_sidebars(cx: WindowCx)
 	active_sidebar_pane = nil
 	local owned = owned_canvases(cx)
@@ -2216,6 +3162,9 @@ local function close_all_sidebars(cx: WindowCx)
 		end)
 	end
 	close_stale_canvases(cx)
+	for epane, _ in pairs(empty_canvases(cx)) do
+		drop_empty_pane(cx, epane)
+	end
 	save_state()
 	table.clear(synced_tab_ratio)
 end
@@ -2249,19 +3198,23 @@ local function cleanup_orphan_sidebar_tabs(cx: WindowCx, owned: { [number]: bool
 	end
 
 	-- Sidebar-only tabs: move their canvas into the nearest sibling tab that still has a user pane
-	local orphans: { { tab_id: number, spanes: { number } } } = {}
+	local empty_map = empty_canvases(cx)
+	local orphans: { { tab_id: number, spanes: { number }, epanes: { number } } } = {}
 	for _, t in ipairs(sess_tabs) do
 		local has_user = false
 		local spanes: { number } = {}
+		local epanes: { number } = {}
 		for _, pid in ipairs(tab_all_panes(cx, t.id)) do
 			if owned[pid] then
 				table.insert(spanes, pid)
+			elseif empty_map[pid] then
+				table.insert(epanes, pid)
 			else
 				has_user = true
 			end
 		end
-		if not has_user and #spanes > 0 then
-			table.insert(orphans, { tab_id = t.id, spanes = spanes })
+		if not has_user and (#spanes > 0 or #epanes > 0) then
+			table.insert(orphans, { tab_id = t.id, spanes = spanes, epanes = epanes })
 		end
 	end
 
@@ -2284,6 +3237,10 @@ local function cleanup_orphan_sidebar_tabs(cx: WindowCx, owned: { [number]: bool
 			end
 		end
 		if u and target_tab then
+			-- The sibling already has a real user pane, so the placeholder it needed is gone.
+			for _, ep in ipairs(item.epanes) do
+				drop_empty_pane(cx, ep)
+			end
 			last_user_pane_by_tab[target_tab] = u
 			pcall(function()
 				cx.layout:focus(u)
@@ -2555,8 +3512,9 @@ place_sidebar_at_edge = function(
 end
 
 local function refocus_terminal(cx: WindowCx, tab_id: number?, owned: { [number]: boolean })
+	local empties = empty_canvases(cx)
 	local f = cx.session:focused()
-	if f and not owned[f] then
+	if f and not owned[f] and not empties[f] then
 		local ftab = cx.session:tab_of(f)
 		if ftab then
 			last_user_pane_by_tab[ftab] = f
@@ -2573,13 +3531,29 @@ local function refocus_terminal(cx: WindowCx, tab_id: number?, owned: { [number]
 		pcall(function()
 			cx.layout:focus(u)
 		end)
+		return
+	end
+	-- An empty session has no user pane: focus belongs on the placeholder, not the strip.
+	for _, p in ipairs(tab_all_panes(cx, t_id)) do
+		if empties[p] then
+			pcall(function()
+				cx.layout:focus(p)
+			end)
+			return
+		end
 	end
 end
 
 -- ---------------------------------------------------------------------------
 -- Core Sync & Render Entrypoint
 -- ---------------------------------------------------------------------------
-local function sync_and_render(cx: WindowCx, force_paint: boolean?)
+local function sync_and_render(
+	cx: WindowCx,
+	force_paint: boolean?,
+	pre_data: CollectedData?,
+	pre_fp: string?,
+	pre_sec_fp: { [string]: string }?
+)
 	if busy_lock then
 		render_pending = true
 		return
@@ -2588,68 +3562,18 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 	-- A hover frame only redraws the changed columns: moving the pane, refocusing the terminal
 	-- and refreshing Chrome on every 30ms drag frame is what made dragging feel laggy.
 	local drag_fast = last_drag_active and not force_paint and active_sidebar_pane ~= nil
+	-- A build that needs another slice returns early: this hook ends here, the next one resumes it.
+	local yielded = false
 
 	local ok, err = pcall(function()
 		if not persisted.visible then
+			deferred = nil
 			close_all_sidebars(cx)
 			return
 		end
 		if not drag_fast then
 			ensure_drag_helper()
 		end
-		-- A session with no tabs shows Tern's "No Terminals open" and has nothing to hold the
-		-- sidebar: hand the window to a session that still has tabs.
-		pcall(function()
-			if drag_fast then
-				return
-			end
-			local ok_t, tlist = pcall(function()
-				return cx.session:tabs()
-			end)
-			local ok_cur, cur = pcall(function()
-				return cx.sessions:current()
-			end)
-			if not ok_t or type(tlist) ~= "table" or not ok_cur or not cur then
-				return
-			end
-			local cur_has_tab = false
-			for _, t in ipairs(tlist) do
-				if t.session == cur.id then
-					cur_has_tab = true
-					break
-				end
-			end
-			if cur_has_tab then
-				return
-			end
-			local same_host: { [number]: boolean } = {}
-			local ok_ss, slist = pcall(function()
-				return cx.sessions:list()
-			end)
-			if ok_ss and type(slist) == "table" then
-				for _, si in ipairs(slist) do
-					if si.host == cur.host then
-						same_host[si.id] = true
-					end
-				end
-			end
-			local target: number? = nil
-			local fallback: number? = nil
-			for _, t in ipairs(tlist) do
-				if t.session ~= cur.id then
-					if same_host[t.session] then
-						target = t.session
-						break
-					elseif not fallback then
-						fallback = t.session
-					end
-				end
-			end
-			local pick = target or fallback
-			if pick then
-				cx.sessions:switch(pick)
-			end
-		end)
 		local ok_cs, cur_sess = pcall(function()
 			return cx.sessions:current()
 		end)
@@ -2666,6 +3590,12 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 			end
 		end)
 
+		-- The overview tab is the plugin's second surface: no sidebar strip may split it.
+		if ok_cs and cur_sess and cur_sess.name == OVERVIEW_SESSION and active_host_kind == "local" then
+			active_sidebar_pane = nil
+			return
+		end
+
 		close_stale_canvases(cx, active_host_id)
 		local owned = owned_canvases(cx)
 
@@ -2673,32 +3603,106 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 		cleanup_orphan_sidebar_tabs(cx, owned, active_sess_id)
 		owned = owned_canvases(cx)
 
-		local data = collect_data(cx)
+		local data = pre_data or collect_data(cx)
 		local tab_id = data.active_tab_id
+		local sname = if ok_cs and cur_sess then cur_sess.name else ""
+		local efp = tostring(active_sess_id) .. ":" .. sname
+
+		-- A session with no tab at all still stays current: its placeholder opens in a fresh tab.
 		if not tab_id then
-			return
+			if not active_sess_id or not canvas_host_ready(active_host_id, active_host_tern) then
+				return
+			end
+			local opened_empty, open_err = cx.canvas:open({
+				title = EMPTY_TITLE,
+				about = EMPTY_ABOUT,
+				how = "tab",
+				focus = true,
+				view = build_empty_session_view(active_sess_id, sname),
+			})
+			if not opened_empty then
+				refuse_canvas_on_host(active_host_id, active_host_tern)
+				tern.log.warn("sidebar2: empty canvas unavailable on this host:", tostring(open_err))
+				return
+			end
+			tab_id = cx.session:tab_of(opened_empty)
+			if not tab_id then
+				return
+			end
+			empty_panes[opened_empty] = true
+			opened_at_ms[opened_empty] = tern.now()
+			painted_empty_fp[opened_empty] = efp
+			pcall(function()
+				cx.layout:name_tab(tab_id, EMPTY_TITLE)
+			end)
+			chrome_tab_titles[tab_id] = nil
 		end
 
+		local tab_epane = placeholder_pane_of(cx, tab_id)
 		local user_pane = first_user_pane(cx, tab_id, data.owned)
-		if not user_pane then
-			-- A tab whose last user pane closed is closing: take the canvas with it instead of
-			-- splitting a fresh terminal in, so a closed tab never comes back on its own.
-			for pid, _ in pairs(data.owned) do
-				if cx.session:tab_of(pid) == tab_id then
-					closing_internally[pid] = true
-					persisted.owned_panes[tostring(pid)] = nil
-					painted_fp[pid] = nil
-					opened_at_ms[pid] = nil
-					pcall(function()
-						cx.layout:close(pid)
-					end)
-				end
+		if user_pane then
+			-- The tab has a real pane again: the placeholder and the tab name it forced are gone.
+			if tab_epane then
+				drop_empty_pane(cx, tab_epane)
+				pcall(function()
+					cx.layout:name_tab(tab_id, nil)
+				end)
+				chrome_tab_titles[tab_id] = nil
 			end
+		elseif not tab_epane then
+			-- A tab whose last pane closed is closing: a canvas split into it would keep it alive.
+			if #tab_all_panes(cx, tab_id) == 0 then
+				return
+			end
+			-- A tab whose last user pane closed, or the active tab of an empty session: the main
+			-- area shows the placeholder instead of a blank tab.
+			if not canvas_host_ready(active_host_id, active_host_tern) then
+				return
+			end
+			local existing_spane = find_host_sidebar(cx, tab_id, data.owned)
+			local opened_empty, open_err = cx.canvas:open({
+				title = EMPTY_TITLE,
+				about = EMPTY_ABOUT,
+				how = if existing_spane then "beside" else "tab",
+				target = existing_spane,
+				dir = if persisted.side == "left" then "right" else "left",
+				ratio = 1 - persisted.ratio,
+				focus = true,
+				view = build_empty_session_view(active_sess_id, sname),
+			})
+			if not opened_empty then
+				refuse_canvas_on_host(active_host_id, active_host_tern)
+				tern.log.warn("sidebar2: empty canvas unavailable on this host:", tostring(open_err))
+				return
+			end
+			tab_epane = opened_empty
+			empty_panes[tab_epane] = true
+			opened_at_ms[tab_epane] = tern.now()
+			painted_empty_fp[tab_epane] = efp
+		elseif force_paint or painted_empty_fp[tab_epane] ~= efp or needs_empty_hydration(cx, tab_epane) then
+			-- A canvas that just spawned may still be hydrating: a failed paint just retries on the
+			-- next sync, and closing it here would leave the session on Tern's empty screen.
+			local ok_set = pcall(function()
+				cx.canvas:set(tab_epane, {
+					title = EMPTY_TITLE,
+					about = EMPTY_ABOUT,
+					view = build_empty_session_view(active_sess_id, sname),
+				})
+			end)
+			painted_empty_fp[tab_epane] = if ok_set then efp else nil
+		end
+		local target_pane: number? = user_pane or tab_epane
+		if not target_pane then
 			return
 		end
 
 		local spane = find_host_sidebar(cx, tab_id, data.owned)
-		local fp, sec_fp = build_fingerprint(data)
+		local fp: string, sec_fp: { [string]: string }
+		if pre_fp and pre_sec_fp then
+			fp, sec_fp = pre_fp, pre_sec_fp
+		else
+			fp, sec_fp = build_fingerprint(data)
+		end
 
 		-- Building the tree is the expensive half of a sync, so it only happens when something
 		-- is actually going to be drawn: a fresh canvas, a forced repaint, a changed view, a
@@ -2718,7 +3722,29 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 		local dock: Node? = nil
 		local sections: { [string]: Node } = {}
 		if stale then
-			view, dock, sections = build_view(data)
+			local parked = deferred
+			if parked and parked.fp == fp then
+				view, dock, sections = parked.view, parked.dock, parked.sections
+				deferred = nil
+			else
+				local state, v, d, s = run_sliced("sidebar", fp, function()
+					return build_view(data)
+				end)
+				if state == "yielded" then
+					yielded = true
+					wake(cx, "sidebar", function(wcx)
+						sync_and_render(wcx, force_paint)
+					end)
+					return
+				end
+				view, dock, sections = v, d, s
+				deferred = { fp = fp, view = view, dock = dock, sections = sections }
+				yielded = true
+				wake(cx, "sidebar", function(wcx)
+					sync_and_render(wcx, force_paint)
+				end)
+				return
+			end
 		end
 
 		if not spane then
@@ -2729,7 +3755,7 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 				title = SIDEBAR_TITLE,
 				about = SIDEBAR_ABOUT,
 				how = "beside",
-				target = user_pane,
+				target = target_pane,
 				dir = persisted.side,
 				ratio = persisted.ratio,
 				focus = false,
@@ -2865,12 +3891,24 @@ local function sync_and_render(cx: WindowCx, force_paint: boolean?)
 	if not ok then
 		tern.log.warn("sidebar2 sync error:", tostring(err))
 	end
+	if yielded then
+		-- The slice re-syncs with fresh data, which covers anything that asked for a repaint now.
+		render_pending = false
+		return
+	end
+	-- The board draws the same sessions, so a sidebar sync is also its cue; it returns at once
+	-- unless the `Tổng quan` tab is the one on screen.
+	if sync_overview ~= nil then
+		pcall(sync_overview, cx, force_paint == true)
+	end
 	if not drag_fast then
 		pcall(tern.chrome.refresh)
 	end
 	if render_pending then
 		render_pending = false
-		sync_and_render(cx, force_paint)
+		wake(cx, "sidebar", function(wcx)
+			sync_and_render(wcx, force_paint)
+		end)
 	end
 end
 
@@ -2950,6 +3988,336 @@ local function close_tab_safely(cx: WindowCx, tid: number, hint_sess_id: number?
 end
 
 -- ---------------------------------------------------------------------------
+-- Overview: find, open and paint the local board tab
+-- ---------------------------------------------------------------------------
+local function find_local_host(cx: WindowCx): ManagedHost?
+	local ok_h, hlist = pcall(function()
+		return cx.hosts:list()
+	end)
+	if ok_h and type(hlist) == "table" then
+		for _, h in ipairs(hlist) do
+			if h.kind == "local" then
+				return h
+			end
+		end
+	end
+	return nil
+end
+
+local function overview_panes(cx: WindowCx): (number?, number?)
+	local board: number? = nil
+	local wait: number? = nil
+	local ok_c, clist = pcall(function()
+		return cx.canvas:list()
+	end)
+	if ok_c and type(clist) == "table" then
+		for _, c in ipairs(clist) do
+			if c.owner == tern.plugin.id then
+				if c.title == OVERVIEW_TITLE then
+					board = c.pane
+				elseif c.title == WAITING_TITLE then
+					wait = c.pane
+				end
+			end
+		end
+	end
+	return board, wait
+end
+
+local function overview_session_of(cx: WindowCx, host_id: number): ManagedSession?
+	local ok_s, slist = pcall(function()
+		return cx.sessions:list()
+	end)
+	if ok_s and type(slist) == "table" then
+		for _, s in ipairs(slist) do
+			if s.name == OVERVIEW_SESSION and s.host == host_id then
+				return s
+			end
+		end
+	end
+	return nil
+end
+
+local function session_of_tab(cx: WindowCx, tid: number): number?
+	local ok_t, tlist = pcall(function()
+		return cx.session:tabs()
+	end)
+	if ok_t and type(tlist) == "table" then
+		for _, t in ipairs(tlist) do
+			if t.id == tid then
+				return t.session
+			end
+		end
+	end
+	return nil
+end
+
+-- A canvas opened late or shown after a host switch holds no drawn view until it is set again; the
+-- fingerprint alone would then skip the paint forever.
+local function overview_pane_drawn(cx: WindowCx, pane: number): boolean
+	local ok, info = pcall(function()
+		return cx.canvas:get(pane)
+	end)
+	return ok and info ~= nil and info.view ~= nil
+end
+
+-- A canvas only accepts a paint while its own host and tab are shown, so this gates on both and
+-- draws nothing while the user is somewhere else.
+function sync_overview(cx: WindowCx, force: boolean?)
+	local board, wait = overview_panes(cx)
+	if not board and not wait then
+		overview_board_fp = ""
+		overview_wait_fp = ""
+		return
+	end
+	if not current_is_overview(cx) then
+		return
+	end
+	local focused = cx.session:focused()
+	local shown_tab = if focused then cx.session:tab_of(focused) else nil
+	local ov_tab = (if board then cx.session:tab_of(board) else nil)
+		or (if wait then cx.session:tab_of(wait) else nil)
+	if not ov_tab or (shown_tab and shown_tab ~= ov_tab) then
+		return
+	end
+	local data = collect_data(cx)
+	local bfp = overview_board_key(data)
+	local wfp = overview_wait_key(data)
+	if board and (force or bfp ~= overview_board_fp or not overview_pane_drawn(cx, board)) then
+		local state, v = run_sliced("overview_board", bfp, function()
+			return build_overview_board(data)
+		end)
+		if state == "yielded" then
+			wake(cx, "overview_board", function(wcx)
+				sync_overview(wcx, force)
+			end)
+			return
+		end
+		local ok = pcall(function()
+			cx.canvas:set(board, {
+				title = OVERVIEW_TITLE,
+				about = OVERVIEW_ABOUT,
+				view = v,
+			})
+		end)
+		overview_board_fp = if ok then bfp else ""
+	end
+	if wait and (force or wfp ~= overview_wait_fp or not overview_pane_drawn(cx, wait)) then
+		local state, v = run_sliced("overview_wait", wfp, function()
+			return build_overview_waiting(data)
+		end)
+		if state == "yielded" then
+			wake(cx, "overview_wait", function(wcx)
+				sync_overview(wcx, force)
+			end)
+			return
+		end
+		local ok = pcall(function()
+			cx.canvas:set(wait, {
+				title = WAITING_TITLE,
+				about = OVERVIEW_ABOUT,
+				view = v,
+			})
+		end)
+		overview_wait_fp = if ok then wfp else ""
+	end
+end
+
+-- A freshly spawned canvas may refuse a paint until its runtime registers: retry like the
+-- sidebar's own hydration schedule, with the 2s sweep as the final fallback.
+local function schedule_overview_paint()
+	for _, delay in ipairs({ 150, 400, 900 }) do
+		tern.timer(delay, function(tcx: WindowCx?)
+			if tcx then
+				pcall(sync_overview, tcx, true)
+			end
+		end)
+	end
+end
+
+local function finish_open_overview(cx: WindowCx, local_host: ManagedHost)
+	overview_opening = false
+	local ok_cur, cur = pcall(function()
+		return cx.hosts:current()
+	end)
+	if not ok_cur or not cur or cur.kind ~= "local" then
+		cx:toast("error", "Không chuyển được về host cục bộ")
+		return
+	end
+
+	local board, wait = overview_panes(cx)
+	if board and wait then
+		local board_tab = cx.session:tab_of(board)
+		local wait_tab = cx.session:tab_of(wait)
+		local tid = board_tab or wait_tab
+		local sid = if tid then session_of_tab(cx, tid) else nil
+		if sid then
+			pcall(function()
+				cx.sessions:switch(sid)
+			end)
+		end
+		if board_tab and wait_tab and board_tab ~= wait_tab then
+			pcall(function()
+				cx.layout.move_to_tab(wait, board_tab)
+			end)
+		end
+		local ok_p, pinfo = pcall(function()
+			return cx.session:pane(board)
+		end)
+		if ok_p and pinfo and pinfo.parked == true then
+			pcall(function()
+				cx.layout:unpark(board)
+			end)
+		end
+		pcall(function()
+			cx.layout:focus(board)
+		end)
+		sync_overview(cx, true)
+		return
+	elseif board then
+		pcall(function()
+			cx.canvas:open({
+				title = WAITING_TITLE,
+				about = OVERVIEW_ABOUT,
+				how = "beside",
+				target = board,
+				dir = "right",
+				ratio = OVERVIEW_WAIT_RATIO,
+				focus = false,
+			})
+		end)
+		pcall(function()
+			cx.layout:focus(board)
+		end)
+		overview_wait_fp = ""
+		sync_overview(cx, true)
+		schedule_overview_paint()
+		return
+	elseif wait then
+		local opened: number? = nil
+		pcall(function()
+			opened = cx.canvas:open({
+				title = OVERVIEW_TITLE,
+				about = OVERVIEW_ABOUT,
+				how = "beside",
+				target = wait,
+				dir = "left",
+				ratio = 1 - OVERVIEW_WAIT_RATIO,
+				focus = false,
+			})
+		end)
+		if opened then
+			local tid = cx.session:tab_of(opened)
+			if tid then
+				pcall(function()
+					cx.layout:name_tab(tid, OVERVIEW_TAB)
+				end)
+				chrome_tab_titles[tid] = nil
+			end
+			pcall(function()
+				cx.layout:focus(opened)
+			end)
+		end
+		overview_board_fp = ""
+		sync_overview(cx, true)
+		schedule_overview_paint()
+		return
+	end
+
+	-- Neither pane exists: make the dedicated local session, then this tab inside it.
+	local sess = overview_session_of(cx, local_host.id)
+	if not sess then
+		local ok, created = pcall(function()
+			return cx.sessions:create({ name = OVERVIEW_SESSION })
+		end)
+		if not ok or not created then
+			cx:toast("error", "Không tạo được session Tổng quan")
+			return
+		end
+		pcall(cx.sessions.lock, cx.sessions, created.id)
+		sess = created
+	else
+		local ok_cs, cur_sess = pcall(function()
+			return cx.sessions:current()
+		end)
+		if ok_cs and cur_sess and cur_sess.id ~= sess.id then
+			pcall(function()
+				cx.sessions:switch(sess.id)
+			end)
+		end
+		pcall(cx.sessions.lock, cx.sessions, sess.id)
+	end
+
+	local opened_board: number? = nil
+	pcall(function()
+		opened_board = cx.canvas:open({
+			title = OVERVIEW_TITLE,
+			about = OVERVIEW_ABOUT,
+			how = "tab",
+			focus = false,
+		})
+	end)
+	if not opened_board then
+		cx:toast("error", "Host cục bộ không mở được canvas Tổng quan")
+		return
+	end
+	local tid = cx.session:tab_of(opened_board)
+	if tid then
+		pcall(function()
+			cx.layout:name_tab(tid, OVERVIEW_TAB)
+		end)
+		-- Dropping the cached chrome title keeps Tern's native tab name visible for this tab.
+		chrome_tab_titles[tid] = nil
+	end
+	-- A failed waiting pane still leaves a usable board; the next click retries it.
+	pcall(function()
+		cx.canvas:open({
+			title = WAITING_TITLE,
+			about = OVERVIEW_ABOUT,
+			how = "beside",
+			target = opened_board,
+			dir = "right",
+			ratio = OVERVIEW_WAIT_RATIO,
+			focus = false,
+		})
+	end)
+	pcall(function()
+		cx.layout:focus(opened_board)
+	end)
+	overview_board_fp = ""
+	overview_wait_fp = ""
+	sync_overview(cx, true)
+	schedule_overview_paint()
+end
+
+local function open_overview(cx: WindowCx)
+	if overview_opening then
+		return
+	end
+	local local_host = find_local_host(cx)
+	if not local_host then
+		cx:toast("error", "Không có host cục bộ để mở Tổng quan")
+		return
+	end
+	local ok_cur, cur = pcall(function()
+		return cx.hosts:current()
+	end)
+	if not ok_cur or not cur or cur.id ~= local_host.id then
+		overview_opening = true
+		pcall(cx.hosts.switch, cx.hosts, local_host.name)
+		tern.timer(450, function(tcx: WindowCx?)
+			if tcx then
+				finish_open_overview(tcx, local_host)
+			else
+				overview_opening = false
+			end
+		end)
+	else
+		finish_open_overview(cx, local_host)
+	end
+end
+
+-- ---------------------------------------------------------------------------
 -- Show / Hide / Flip Side / Kanban Group Actions
 -- ---------------------------------------------------------------------------
 -- Defined with the watcher at the end of the file; a hidden sidebar must not keep timers alive.
@@ -2972,7 +4340,7 @@ local function set_sidebar_visible(cx: WindowCx, visible: boolean)
 		close_all_sidebars(cx)
 		pcall(tern.chrome.refresh)
 	else
-		start_watcher()
+		start_watcher(cx)
 		sync_and_render(cx, true)
 	end
 end
@@ -3029,6 +4397,7 @@ local function set_session_group(cx: WindowCx, skey: string, group: GroupId, man
 	hover_sess_pos = nil
 	save_state()
 	sync_and_render(cx, true)
+	pcall(sync_overview, cx, true)
 end
 
 local function cycle_session_group(cx: WindowCx, skey: string)
@@ -3141,6 +4510,50 @@ end
 -- ---------------------------------------------------------------------------
 -- Canvas Action Dispatcher
 -- ---------------------------------------------------------------------------
+-- A new terminal in a session whose tab only holds the placeholder fills that tab in place: a
+-- second tab beside an empty one is the same waste of space the placeholder exists to avoid.
+local function open_tab_or_fill_placeholder(cx: WindowCx, tid: number?, launch: Launch?)
+	if tid and first_user_pane(cx, tid, owned_canvases(cx)) == nil then
+		local epane = placeholder_pane_of(cx, tid)
+		if epane then
+			local ok_s, new_p = pcall(function()
+				return cx.layout:split(epane, "right", launch, { focus = true })
+			end)
+			if ok_s and new_p then
+				drop_empty_pane(cx, epane)
+				pcall(function()
+					cx.layout:name_tab(tid, nil)
+				end)
+				chrome_tab_titles[tid] = nil
+				return
+			end
+		end
+	end
+	pcall(function()
+		cx.layout:new_tab(launch, { focus = true })
+	end)
+end
+
+local function switch_to_session(cx: WindowCx, sid: number?)
+	local ok_cs, cur = pcall(function()
+		return cx.sessions:current()
+	end)
+	if sid and (not ok_cs or not cur or cur.id ~= sid) then
+		pcall(function()
+			cx.sessions:switch(sid)
+		end)
+	end
+end
+
+-- `Tạo pane` in an empty session: a terminal in place of the placeholder.
+local function fill_empty_session(cx: WindowCx, sid: number?, epane: number?)
+	switch_to_session(cx, sid)
+	local tid = if epane then cx.session:tab_of(epane) else nil
+	local cwd = new_tab_cwd(cx, sid, tid)
+	open_tab_or_fill_placeholder(cx, tid, if cwd then { cwd = cwd } else nil)
+	sync_and_render(cx, true)
+end
+
 local function parse_action(ev: CanvasAction): (string, string)
 	local act = ev.act or ""
 	local val = ev.value or ""
@@ -3151,55 +4564,147 @@ local function parse_action(ev: CanvasAction): (string, string)
 	return act, val
 end
 
-local function focus_session_tab_pane(cx: WindowCx, sess_id: number?, tab_id: number?, pane_id: number?)
-	local owned = owned_canvases(cx)
+-- The board draws every host's sessions, but `sessions:switch` only reaches the current host:
+-- a click on a remote card has to move the window onto that host and wait for the daemon.
+local function session_host_of(cx: WindowCx, sess_id: number): (number?, string?)
+	local host_id: number? = nil
+	local ok_s, slist = pcall(function()
+		return cx.sessions:list()
+	end)
+	if ok_s and type(slist) == "table" then
+		for _, s in ipairs(slist) do
+			if s.id == sess_id then
+				host_id = s.host
+				break
+			end
+		end
+	end
+	if not host_id then
+		return nil, nil
+	end
+	local ok_h, hlist = pcall(function()
+		return cx.hosts:list()
+	end)
+	if ok_h and type(hlist) == "table" then
+		for _, h in ipairs(hlist) do
+			if h.id == host_id then
+				return host_id, h.name
+			end
+		end
+	end
+	return host_id, nil
+end
+
+local function run_in_session(cx: WindowCx, sess_id: number?, fn: (WindowCx) -> ())
+	if not sess_id then
+		fn(cx)
+		return
+	end
+	local want_host, want_name = session_host_of(cx, sess_id)
+	local ok_ch, cur_host = pcall(function()
+		return cx.hosts:current()
+	end)
+	if want_host and want_name and want_name ~= "" and ok_ch and cur_host and cur_host.id ~= want_host then
+		pcall(function()
+			cx.hosts:switch(want_name)
+		end)
+		-- Both the host switch and the session switch are async: poll, then run once it lands.
+		local tries = 0
+		local function hop(tcx: WindowCx?)
+			if not tcx then
+				return
+			end
+			tries += 1
+			local ok_h2, h2 = pcall(function()
+				return tcx.hosts:current()
+			end)
+			if ok_h2 and h2 and h2.id == want_host then
+				pcall(function()
+					tcx.sessions:switch(sess_id)
+				end)
+				tern.timer(30, function(scx: WindowCx?)
+					if scx then
+						fn(scx)
+					end
+				end)
+			elseif tries < 40 then
+				tern.timer(30, hop)
+			end
+		end
+		tern.timer(30, hop)
+		return
+	end
 	local ok_cs, cur = pcall(function()
 		return cx.sessions:current()
 	end)
-	if sess_id and (not ok_cs or not cur or cur.id ~= sess_id) then
+	if not ok_cs or not cur or cur.id ~= sess_id then
 		pcall(function()
 			cx.sessions:switch(sess_id)
 		end)
 	end
-	if pane_id and not owned[pane_id] then
-		pane_notif[pane_id] = nil
-		ack_alerts[pane_id] = true
-		if tab_id then
-			last_user_pane_by_tab[tab_id] = pane_id
-		end
-		pcall(function()
-			cx.layout:focus(pane_id)
-		end)
-	elseif tab_id then
-		for _, p in ipairs(tab_all_panes(cx, tab_id)) do
-			pane_notif[p] = nil
-			ack_alerts[p] = true
-		end
-		local u = first_user_pane(cx, tab_id, owned)
-		if u then
-			pane_notif[u] = nil
-			ack_alerts[u] = true
-			last_user_pane_by_tab[tab_id] = u
+	fn(cx)
+end
+
+-- `New Tab` / `New Tab omp` from either surface, and the `+` on a board card: the session may
+-- live on another host, so the tab can only be created after run_in_session moved the window.
+local function create_tab_in_session(cx: WindowCx, val: string, with_omp: boolean)
+	local s_str, t_str = string.match(val, "^(%d+):(%d+)$")
+	local sid = tonumber(s_str) or tonumber(val)
+	local tid = tonumber(t_str)
+	-- Read the folder on the host the cursor is on; it is the same one after a switch unless the
+	-- session lives elsewhere, in which case the callback reads it again on the new host.
+	local pre_cwd = new_tab_cwd(cx, sid, tid)
+	run_in_session(cx, sid, function(tcx: WindowCx)
+		local cwd = pre_cwd or new_tab_cwd(tcx, sid, tid)
+		open_tab_or_fill_placeholder(tcx, tid, { command = if with_omp then "omp" else nil, cwd = cwd })
+		sync_and_render(tcx, true)
+		pcall(sync_overview, tcx, true)
+	end)
+end
+
+local function focus_session_tab_pane(cx: WindowCx, sess_id: number?, tab_id: number?, pane_id: number?)
+	run_in_session(cx, sess_id, function(tcx: WindowCx)
+		local owned = owned_canvases(tcx)
+		if pane_id and not owned[pane_id] then
+			pane_notif[pane_id] = nil
+			ack_alerts[pane_id] = true
+			if tab_id then
+				last_user_pane_by_tab[tab_id] = pane_id
+			end
 			pcall(function()
-				cx.layout:focus(u)
+				tcx.layout:focus(pane_id)
 			end)
-		end
-	elseif sess_id then
-		local ok_t, tlist = pcall(function()
-			return cx.session:tabs()
-		end)
-		if ok_t and type(tlist) == "table" then
-			for _, t in ipairs(tlist) do
-				if t.session == sess_id then
-					for _, p in ipairs(tab_all_panes(cx, t.id)) do
-						pane_notif[p] = nil
-						ack_alerts[p] = true
+		elseif tab_id then
+			for _, p in ipairs(tab_all_panes(tcx, tab_id)) do
+				pane_notif[p] = nil
+				ack_alerts[p] = true
+			end
+			local u = first_user_pane(tcx, tab_id, owned)
+			if u then
+				pane_notif[u] = nil
+				ack_alerts[u] = true
+				last_user_pane_by_tab[tab_id] = u
+				pcall(function()
+					tcx.layout:focus(u)
+				end)
+			end
+		elseif sess_id then
+			local ok_t, tlist = pcall(function()
+				return tcx.session:tabs()
+			end)
+			if ok_t and type(tlist) == "table" then
+				for _, t in ipairs(tlist) do
+					if t.session == sess_id then
+						for _, p in ipairs(tab_all_panes(tcx, t.id)) do
+							pane_notif[p] = nil
+							ack_alerts[p] = true
+						end
 					end
 				end
 			end
 		end
-	end
-	sync_and_render(cx, false)
+		sync_and_render(tcx, false)
+	end)
 end
 
 tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
@@ -3219,6 +4724,12 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		return true
 	elseif cmd == "refresh" then
 		sync_and_render(cx, true)
+		return true
+	elseif cmd == "open_overview" then
+		open_overview(cx)
+		return true
+	elseif cmd == "refresh_overview" then
+		sync_overview(cx, true)
 		return true
 	elseif cmd == "toggle_badge_cfg" then
 		badge_cfg_open = not badge_cfg_open
@@ -3482,42 +4993,18 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		return true
 	elseif cmd == "new_tab" then
 		local cwd = new_tab_cwd(cx, nil, nil)
-		pcall(function()
-			cx.layout:new_tab(if cwd then { cwd = cwd } else nil, { focus = true })
-		end)
+		local f = cx.session:focused()
+		open_tab_or_fill_placeholder(cx, if f then cx.session:tab_of(f) else nil, if cwd then { cwd = cwd } else nil)
 		sync_and_render(cx, true)
+		return true
+	elseif cmd == "new_pane_empty" then
+		fill_empty_session(cx, tonumber(val), ev.pane)
 		return true
 	elseif cmd == "new_tab_in" then
-		local s_str, t_str = string.match(val, "^(%d+):(%d+)$")
-		local sid = tonumber(s_str) or tonumber(val)
-		local tid = tonumber(t_str)
-		local cwd = new_tab_cwd(cx, sid, tid)
-		pcall(function()
-			local ok_cs, cur = pcall(function()
-				return cx.sessions:current()
-			end)
-			if sid and (not ok_cs or not cur or cur.id ~= sid) then
-				cx.sessions:switch(sid)
-			end
-			cx.layout:new_tab(if cwd then { cwd = cwd } else nil, { focus = true })
-		end)
-		sync_and_render(cx, true)
+		create_tab_in_session(cx, val, false)
 		return true
 	elseif cmd == "new_omp_in" then
-		local s_str, t_str = string.match(val, "^(%d+):(%d+)$")
-		local sid = tonumber(s_str) or tonumber(val)
-		local tid = tonumber(t_str)
-		local cwd = new_tab_cwd(cx, sid, tid)
-		pcall(function()
-			local ok_cs, cur = pcall(function()
-				return cx.sessions:current()
-			end)
-			if sid and (not ok_cs or not cur or cur.id ~= sid) then
-				cx.sessions:switch(sid)
-			end
-			cx.layout:new_tab({ command = "omp", cwd = cwd }, { focus = true })
-		end)
-		sync_and_render(cx, true)
+		create_tab_in_session(cx, val, true)
 		return true
 	elseif cmd == "rename_sess" then
 		local sid = tonumber(val)
@@ -3617,6 +5104,37 @@ tern.chrome.status(function(_pane: StatusPaneInfo): { StatusSegment }?
 	end
 end)
 
+-- The window foot's own segment: the same state as the status segment above, but it also toggles.
+local function kanban_widget(_pane: StatusPaneInfo?): WidgetView?
+	if not persisted.visible then
+		return {
+			text = "OFF",
+			tone = "muted",
+			command = "plugin.sidebar2.toggle",
+			title = "Kanban sidebar: click to show",
+		}
+	end
+	return {
+		text = current_stage_label
+			.. " · "
+			.. tostring(widget_counts.total)
+			.. " agent · "
+			.. tostring(widget_counts.running)
+			.. " chạy",
+		tone = current_stage_tone,
+		command = "plugin.sidebar2.toggle",
+		title = "Kanban sidebar: click to hide",
+	}
+end
+
+tern.chrome.widget("kanban", {
+	name = "Kanban",
+	description = "Sidebar stage and counts; click to show or hide",
+	icon = "kanban",
+	styles = { "text" },
+	render = kanban_widget,
+})
+
 -- The vertical tab strip and tab menus name a tab by its first user pane (see collect_data); nil
 -- keeps Tern's default. collect_data refills the cache and sync_and_render already calls
 -- `tern.chrome.refresh()` after painting, which drops the formatter's per-input cache.
@@ -3679,6 +5197,15 @@ tern.command({
 	end,
 })
 
+tern.command({
+	id = "overview",
+	title = "Kanban Sidebar: Mở Tổng quan (tab trên PC)",
+	icon = "eye",
+	run = function(cx: WindowCx)
+		open_overview(cx)
+	end,
+})
+
 pcall(function()
 	tern.bind("ctrl+alt+b", "plugin.sidebar2.toggle")
 	tern.bind("cmd+alt+b", "plugin.sidebar2.toggle")
@@ -3688,7 +5215,7 @@ end)
 -- Lifecycle Hooks & 250ms Session/Tab Watcher Tick
 -- ---------------------------------------------------------------------------
 local function poll_drag_ipc(cx: WindowCx)
-	if busy_lock or not persisted.visible then
+	if busy_lock or not (persisted.visible or current_is_overview(cx)) then
 		return
 	end
 	local ok_dd, dd = pcall(tern.kv.get, "drag_drop")
@@ -3711,6 +5238,7 @@ local function poll_drag_ipc(cx: WindowCx)
 				cx.layout:order_tab(dd.tab_id, dd.target_pos)
 			end)
 			sync_and_render(cx, true)
+			pcall(sync_overview, cx, true)
 		end
 		return
 	end
@@ -3782,7 +5310,7 @@ end
 
 local function drag_step(cx: WindowCx?)
 	drag_timer = nil
-	if not persisted.visible then
+	if not (persisted.visible or (cx ~= nil and current_is_overview(cx))) then
 		return
 	end
 	-- Reschedule first: a failing poll must never end the watch loop.
@@ -3796,6 +5324,16 @@ local function drag_step(cx: WindowCx?)
 end
 
 local function step_body(cx: WindowCx)
+	if current_is_overview(cx) then
+		-- The board is the only surface on screen: keep its drag IPC and paint alive, and let the
+		-- sweep below place no sidebar (there is none in this session).
+		ensure_drag_helper(false, true)
+		if not drag_timer then
+			drag_timer = tern.timer(30, drag_step)
+		end
+		sync_overview(cx, false)
+		return
+	end
 	ensure_drag_helper()
 	local ok_cs, cur_s = pcall(function()
 		return cx.sessions:current()
@@ -3823,14 +5361,14 @@ local function step_body(cx: WindowCx)
 		sync_and_render(cx, false)
 	else
 		local data = collect_data(cx)
-		local fp = build_fingerprint(data)
+		local fp, sec_fp = build_fingerprint(data)
 		local cur_host = if ok_cs and cur_s then cur_s.host else 0
 		local spane = find_host_sidebar(cx, data.active_tab_id, data.owned)
 		if data.active_tab_id and not spane then
 			active_sidebar_pane = nil
-			sync_and_render(cx, true)
+			sync_and_render(cx, true, data, fp, sec_fp)
 		elseif spane and (painted_fp[spane] ~= fp or needs_hydration(cx, spane)) then
-			sync_and_render(cx, true)
+			sync_and_render(cx, true, data, fp, sec_fp)
 		elseif data.active_tab_id then
 			place_sidebar_at_edge(cx, spane, data.active_tab_id, persisted.side, persisted.ratio)
 			if cx.session:focused() == spane then
@@ -3844,7 +5382,7 @@ end
 -- syncs at once, so this only has to catch what no event reports.
 local function step(cx: WindowCx?)
 	watch_timer = nil
-	if not persisted.visible then
+	if not (persisted.visible or (cx ~= nil and current_is_overview(cx))) then
 		return
 	end
 	-- Reschedule first: one throw must not end the loop; it used to leave the sidebar gone for good.
@@ -3858,11 +5396,11 @@ local function step(cx: WindowCx?)
 	end
 end
 
-function start_watcher()
+function start_watcher(cx: WindowCx?)
 	if watch_timer then
 		return
 	end
-	if not persisted.visible then
+	if not (persisted.visible or (cx ~= nil and current_is_overview(cx))) then
 		stop_watcher()
 		return
 	end
@@ -3875,7 +5413,7 @@ end
 tern.on("window_start", function(cx: WindowCx)
 	ensure_drag_helper(true)
 	sync_and_render(cx, true)
-	start_watcher()
+	start_watcher(cx)
 end)
 
 start_watcher()
@@ -3883,47 +5421,66 @@ start_watcher()
 -- omp's `propose` tool ends the turn with a plan the user must approve, and the block stays
 -- `idle` while it waits, so the badge reads the tail of the transcript once in a while.
 -- shortcut: 2s sweep and the `propose` tool title, revisit if omp renames the tool.
+local plan_cursor = 0
+local PLAN_SWEEP_MAX = 2
 local function refresh_plan_pending(cx: WindowCx)
-	local next_pending: { [number]: boolean } = {}
 	local ok_a, alist = pcall(function()
 		return cx.agents:list()
 	end)
 	if not ok_a or type(alist) ~= "table" then
 		return
 	end
+	-- A plan can leave the block `idle` or sitting at `waiting_input`; only a running turn
+	-- cannot be waiting for approval.
+	local cands: { number } = {}
+	local is_cand: { [number]: boolean } = {}
 	for _, a in ipairs(alist) do
-		-- A plan can leave the block `idle` or sitting at `waiting_input`; only a running turn
-		-- cannot be waiting for approval.
 		if (a.state == "idle" or a.state == "waiting_input") and type(a.pane) == "number" then
-			local ok_t, msgs = pcall(function()
-				return cx.agents:transcript(a.pane, { last = 12 })
-			end)
-			-- The plan waits only while nothing came after it: the nearest user message or any
-			-- other tool closes it. omp keeps working in the same turn after the approval, so a
-			-- propose followed by edits is a plan already being carried out.
-			if ok_t and type(msgs) == "table" then
-				local pending = false
-				for i = #msgs, 1, -1 do
-					local m = msgs[i]
-					if m.role == "user" then
-						break
-					end
-					local proposals, others = 0, 0
-					for _, t in ipairs(m.tools or {}) do
-						if t.title == "propose" and t.status == "done" then
-							proposals += 1
-						elseif t.title ~= nil then
-							others += 1
-						end
-					end
-					if proposals > 0 or others > 0 then
-						pending = (proposals > 0 and others == 0)
-						break
+			table.insert(cands, a.pane)
+			is_cand[a.pane] = true
+		end
+	end
+	-- Every transcript read is real work, so one pass examines a couple of panes, resuming where
+	-- the last one stopped; a pane it does not reach keeps the answer it already had.
+	local next_pending: { [number]: boolean } = {}
+	for pane, v in pairs(plan_pending) do
+		if is_cand[pane] then
+			next_pending[pane] = v
+		end
+	end
+	local n = #cands
+	for _ = 1, math.min(n, PLAN_SWEEP_MAX) do
+		plan_cursor = (plan_cursor % n) + 1
+		local pane = cands[plan_cursor]
+		local ok_t, msgs = pcall(function()
+			return cx.agents:transcript(pane, { last = 12 })
+		end)
+		-- The plan waits only while nothing came after it: the nearest user message or any
+		-- other tool closes it. omp keeps working in the same turn after the approval, so a
+		-- propose followed by edits is a plan already being carried out.
+		if ok_t and type(msgs) == "table" then
+			next_pending[pane] = nil
+			local pending = false
+			for i = #msgs, 1, -1 do
+				local m = msgs[i]
+				if m.role == "user" then
+					break
+				end
+				local proposals, others = 0, 0
+				for _, t in ipairs(m.tools or {}) do
+					if t.title == "propose" and t.status == "done" then
+						proposals += 1
+					elseif t.title ~= nil then
+						others += 1
 					end
 				end
-				if pending then
-					next_pending[a.pane] = true
+				if proposals > 0 or others > 0 then
+					pending = (proposals > 0 and others == 0)
+					break
 				end
+			end
+			if pending then
+				next_pending[pane] = true
 			end
 		end
 	end
@@ -3938,6 +5495,8 @@ local function schedule_plan_sweep()
 			return
 		end
 		pcall(refresh_plan_pending, cx)
+		-- Keeps the overview live while the sidebar is hidden and its watcher is stopped.
+		pcall(sync_overview, cx, false)
 		schedule_plan_sweep()
 	end)
 end
@@ -3963,12 +5522,20 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	if not owned[ev.pane] then
 		last_user_pane_by_tab[ev.tab] = ev.pane
 	end
+	-- Gates itself on the overview tab being shown, so this is a no-op elsewhere. It also re-arms
+	-- the sweep the sidebar left off when the user lands on the board: this tab takes drags too.
+	pcall(sync_overview, cx, false)
+	pcall(start_watcher, cx)
 	if not persisted.visible then
 		return
 	end
 	-- Clicking the canvas must not repaint (that would swallow its context menu); it only needs a
 	-- sync when its tab lost every user pane.
-	if owned[ev.pane] and ev.tab == last_active_tab_id and first_user_pane(cx, ev.tab, owned) ~= nil then
+	if
+		owned[ev.pane]
+		and ev.tab == last_active_tab_id
+		and (first_user_pane(cx, ev.tab, owned) ~= nil or placeholder_pane_of(cx, ev.tab) ~= nil)
+	then
 		return
 	end
 	sync_and_render(cx, false)
@@ -4008,6 +5575,8 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	if type(ev) == "table" and type(ev.pane) == "number" then
 		local pid = ev.pane
 		local pkey = tostring(pid)
+		empty_panes[pid] = nil
+		painted_empty_fp[pid] = nil
 		if closing_internally[pid] then
 			closing_internally[pid] = nil
 		elseif
@@ -4035,6 +5604,36 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	end
 end)
 
+tern.on("budget", function(ev: BudgetEvent, _cx: WindowCx)
+	if ev.state == "paused" then
+		tern.log.warn("sidebar2 paused on hook", ev.hook, "for", tostring(ev.paused_ms), "ms")
+	else
+		tern.log.info("sidebar2 resumed on hook", ev.hook)
+	end
+end)
+
+-- A session's last pane closing ends it; the 1 s tick used to be the only notice.
+tern.on("session_ended", function(_ev: SessionEndedEvent, cx: WindowCx)
+	painted_fp = {}
+	painted_sec_fp = {}
+	sync_and_render(cx, false)
+end)
+
+-- A sidebar canvas the user floated or docked needs a repaint in its new box.
+tern.on("float_moved", function(ev: FloatMovedEvent, cx: WindowCx)
+	if persisted.owned_panes[tostring(ev.pane)] then
+		painted_fp[ev.pane] = nil
+		painted_sec_fp[ev.pane] = nil
+		sync_and_render(cx, false)
+	end
+end)
+
+-- A drag helper that outlived its VM: drag_helper.py's pid file makes a duplicate spawn exit,
+-- so the next tick respawns it.
+tern.on("process_exit", function(_ev: ProcessExitEvent, _cx: WindowCx)
+	helper_running = false
+end)
+
 for _, ev_name in ipairs({
 	"tab_created",
 	"tab_closed",
@@ -4043,11 +5642,16 @@ for _, ev_name in ipairs({
 	"command_finished",
 	"title",
 	"cwd",
-	"session_ended",
 }) do
 	tern.on(ev_name, function(_ev: any, cx: WindowCx)
-		if not busy_lock and persisted.visible then
+		if busy_lock then
+			return
+		end
+		if persisted.visible then
 			sync_and_render(cx, false)
+		elseif sync_overview ~= nil then
+			-- Hidden sidebar, board on screen: nothing above would repaint it.
+			pcall(sync_overview, cx, false)
 		end
 	end)
 end
@@ -4062,6 +5666,10 @@ pcall(tern.override, "close_tab", function(cx: WindowCx): boolean?
 	if not tid then
 		return nil
 	end
+	-- Ctrl+W in an already-empty session must not take the placeholder or the strip.
+	if first_user_pane(cx, tid, owned_canvases(cx)) == nil and placeholder_pane_of(cx, tid) then
+		return true
+	end
 	close_tab_safely(cx, tid, last_active_session_id)
 	return true
 end)
@@ -4075,10 +5683,14 @@ pcall(tern.override, "close_pane", function(cx: WindowCx): boolean?
 		return nil
 	end
 	local owned = owned_canvases(cx)
+	local tid = cx.session:tab_of(f)
+	-- Ctrl+W in an already-empty session must not take the placeholder or the strip.
+	if tid and first_user_pane(cx, tid, owned) == nil and placeholder_pane_of(cx, tid) then
+		return true
+	end
 	if not owned[f] then
 		return nil
 	end
-	local tid = cx.session:tab_of(f)
 	local u = if tid then first_user_pane(cx, tid, owned) else nil
 	if not u then
 		return nil

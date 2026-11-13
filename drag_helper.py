@@ -21,7 +21,25 @@ GA_ROOT = 2
 DRAG_THRESHOLD_PX = 5.0
 GRIP_WIDTH_PX = 34.0
 RIGHT_ICON_RESERVE_PX = 32.0
-GROUP_IDS = ("todo", "doing", "done")
+GROUP_IDS = ("todo", "doing", "review", "paused", "stuck", "done")
+# The surface the last snapshot found rects on; tried first next time (see snapshot_geometry).
+_last_surface = ""
+
+# The two surfaces draw the same rows with different roles: the sidebar lists them in one column
+# per stage, the `Tổng quan` board wraps six columns. The plugin publishes a DOM map per surface,
+# so the rects are read with the selectors of the surface that painted last.
+SURFACE_SELECTORS = {
+    "sidebar": (
+        "[data-role^='sidebar2.group.']",
+        "[data-role^='sidebar2.level1']",
+        "[data-role^='sidebar2.level2']",
+    ),
+    "overview": (
+        "[data-role^='sidebar2.ov.stage.']",
+        "[data-role^='sidebar2.ov.card']",
+        "[data-role^='sidebar2.ov.tab']",
+    ),
+}
 
 
 def resolve_tern_env(kv: dict | None = None) -> tuple[str, dict]:
@@ -82,57 +100,100 @@ def write_status(data_dir: str, info: dict):
         pass
 
 
-def snapshot_geometry(kv_path: str) -> dict:
+def _query_rects(tern_bin: str, env: dict, selectors: tuple) -> tuple[list, str]:
+    """Rects of every node matching `selectors`, in list order, with the last stderr seen."""
+    procs = [
+        subprocess.Popen(
+            [tern_bin, "ctl", "tree", sel],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        for sel in selectors
+    ]
+    raw_lists = []
+    last_err = ""
+    for p in procs:
+        out, err = p.communicate(timeout=1.5)
+        if p.returncode != 0 and err:
+            last_err = err.strip()
+        nodes = (json.loads(out).get("nodes") or []) if (p.returncode == 0 and out) else []
+        raw_lists.append([
+            n["rect"] for n in nodes
+            if isinstance(n.get("rect"), list)
+            and len(n["rect"]) == 4
+            and n["rect"][2] > 0
+            and n["rect"][3] > 0
+            # A pane in a tab that is not shown is parked far off the left/top edge; its rows
+            # are not on screen, and keeping them would hit-test against another surface.
+            and n["rect"][0] + n["rect"][2] > 0
+            and n["rect"][1] + n["rect"][3] > 0
+        ])
+    return raw_lists, last_err
+
+
+def snapshot_geometry(kv_path: str, avoid: str = "") -> dict:
+    """Rects of the surface on screen; `avoid` demotes a surface that just missed a hit test."""
+    global _last_surface
     kv = load_kv(kv_path)
     dom_map = kv.get("dom_map") or {}
+    ov_map = kv.get("ov_dom_map") or {}
     state = kv.get("state") or {}
+    hint = (kv.get("dom_surface") or {}).get("surface")
+    if hint not in ("sidebar", "overview"):
+        hint = ""
+    # The plugin says which surface it last painted; the paint counters are a weaker tie-break
+    # (a map keeps its old seq while its fingerprint is unchanged, so they often tie).
+    seq_side = int(dom_map.get("seq") or 0)
+    seq_ov = int(ov_map.get("seq") or 0)
     if not state.get("visible", True):
-        return {"valid": False, "reason": "hidden"}
+        # The sidebar is hidden: only the board can still be showing rows.
+        if seq_ov <= 0 and hint != "overview":
+            return {"valid": False, "reason": "hidden"}
+        order = ["overview"]
+    else:
+        guessed = "overview" if seq_ov > seq_side else "sidebar"
+        promo = hint or _last_surface or guessed
+        order = [promo] + [n for n in ("sidebar", "overview") if n != promo]
+    if avoid in order and len(order) > 1:
+        order = [n for n in order if n != avoid] + [avoid]
 
-    l1_meta = dom_map.get("level1") or []
-    l2_meta = dom_map.get("level2") or []
-    side = dom_map.get("side") or state.get("side") or "left"
-    seq = dom_map.get("seq", 0)
     tern_bin, env = resolve_tern_env(kv)
-
+    active = ""
+    raw_lists = None
+    last_err = ""
     try:
-        procs = [
-            subprocess.Popen(
-                [tern_bin, "ctl", "tree", sel],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-                creationflags=CREATE_NO_WINDOW,
-            )
-            for sel in (
-                "[data-role^='sidebar2.group.']",
-                "[data-role^='sidebar2.level1']",
-                "[data-role^='sidebar2.level2']",
-            )
-        ]
-        raw_lists = []
-        last_err = ""
-        for p in procs:
-            out, err = p.communicate(timeout=1.5)
-            if p.returncode != 0 and err:
-                last_err = err.strip()
-            nodes = (json.loads(out).get("nodes") or []) if (p.returncode == 0 and out) else []
-            raw_lists.append([
-                n["rect"] for n in nodes
-                if isinstance(n.get("rect"), list)
-                and len(n["rect"]) == 4
-                and n["rect"][2] > 0
-                and n["rect"][3] > 0
-            ])
-        g_rects, l1_rects, l2_rects = raw_lists
+        for name in order:
+            dm = ov_map if name == "overview" else dom_map
+            if not dm:
+                continue
+            raw_lists, err = _query_rects(tern_bin, env, SURFACE_SELECTORS[name])
+            last_err = err or last_err
+            # An empty first probe means that map is stale: the other surface is the one drawn.
+            if raw_lists[0]:
+                active = name
+                break
+            raw_lists = None
     except Exception as exc:
         return {"valid": False, "reason": str(exc)}
+    if raw_lists is None or not active:
+        return {"valid": False, "reason": last_err or "no_groups"}
+    _last_surface = active
 
+    dm = ov_map if active == "overview" else dom_map
+    l1_meta = dm.get("level1") or []
+    l2_meta = dm.get("level2") or []
+    side = dm.get("side") or state.get("side") or "left"
+    seq = int(dm.get("seq") or 0)
+    g_rects, l1_rects, l2_rects = raw_lists
+
+    group_ids = dm.get("groups") or list(GROUP_IDS)
     groups = []
-    for idx, gid in enumerate(GROUP_IDS):
+    for idx, gid in enumerate(group_ids):
         if idx < len(g_rects):
             groups.append({"id": gid, "rect": g_rects[idx]})
 
@@ -157,14 +218,28 @@ def snapshot_geometry(kv_path: str) -> dict:
     if not groups:
         return {"valid": False, "reason": last_err or "no_groups"}
 
+    # The board wraps six columns, so a stage is a 2D box: a short or empty column shares its row
+    # with taller ones, and the press must find it anywhere in that row's height.
+    for g in groups:
+        gx = g["rect"][0]
+        y_min = g["rect"][1]
+        y_max = g["rect"][1] + g["rect"][3]
+        for other in groups:
+            if abs(other["rect"][0] - gx) < 20.0:
+                y_min = min(y_min, other["rect"][1])
+                y_max = max(y_max, other["rect"][1] + other["rect"][3])
+        g["y_min"] = y_min
+        g["y_max"] = y_max
+
     x_min = min(g["rect"][0] for g in groups)
     x_max = max(g["rect"][0] + g["rect"][2] for g in groups)
-    y_min = min(g["rect"][1] for g in groups)
-    y_max = max(g["rect"][1] + g["rect"][3] for g in groups)
+    y_min = min(g["y_min"] for g in groups)
+    y_max = max(g["y_max"] for g in groups)
 
     return {
         "valid": True,
         "seq": seq,
+        "surface": active,
         "side": side,
         "ts": time.monotonic(),
         "bounds": (x_min, y_min, x_max, y_max),
@@ -217,27 +292,31 @@ def compute_hover_target(snap: dict, drag_item: dict, vx: float, vy: float):
         groups = snap["groups"]
         if not groups or vy < y_min - 50 or vy > y_max + 160:
             return None
+        # Stages wrap on the board, so a stage is a box: horizontal bounds + the whole row's
+        # height. Ties fall back to the nearest box, so a press just outside one still lands.
         best_gid = None
         best_group = None
+        best_dist = 1e9
         for g in groups:
             gx, gy, gw, gh = g["rect"]
-            if gy <= vy <= gy + gh:
+            y0 = g.get("y_min", gy)
+            y1 = g.get("y_max", gy + gh)
+            inside = (gx <= vx <= gx + gw) and (y0 <= vy <= y1)
+            dx = 0.0 if gx <= vx <= gx + gw else min(abs(vx - gx), abs(vx - (gx + gw)))
+            dy = 0.0 if y0 <= vy <= y1 else min(abs(vy - y0), abs(vy - y1))
+            if inside:
                 best_gid = g["id"]
-                best_group = g["rect"]
+                best_group = g
                 break
-        if best_gid is None:
-            best_dist = 1e9
-            for g in groups:
-                gx, gy, gw, gh = g["rect"]
-                dist = 0.0 if (gy <= vy <= gy + gh) else min(abs(vy - gy), abs(vy - (gy + gh)))
-                if dist < best_dist:
-                    best_dist = dist
-                    best_gid = g["id"]
-                    best_group = g["rect"]
+            dist = math.hypot(dx, dy)
+            if dist < best_dist:
+                best_dist = dist
+                best_gid = g["id"]
+                best_group = g
         if best_gid is None:
             return None
 
-        gy, gh = best_group[1], best_group[3]
+        gy, gh = best_group["rect"][1], best_group["rect"][3]
         g_sessions = sorted(
             [s for s in snap["level1"] if s.get("group") == best_gid],
             key=lambda s: s["rect"][1],
@@ -282,7 +361,12 @@ def compute_hover_target(snap: dict, drag_item: dict, vx: float, vy: float):
             return None
         s_ymin = min(t["rect"][1] for t in siblings)
         s_ymax = max(t["rect"][1] + t["rect"][3] for t in siblings)
+        s_xmin = min(t["rect"][0] for t in siblings)
+        s_xmax = max(t["rect"][0] + t["rect"][2] for t in siblings)
+        # Sibling tabs share a session's column: a cursor parked in another column is not a drop.
         if vy < s_ymin - 50 or vy > s_ymax + 80:
+            return None
+        if vx < s_xmin - 80 or vx > s_xmax + 80:
             return None
         best_pos = None
         best_dist = 1e9
@@ -301,6 +385,12 @@ def compute_hover_target(snap: dict, drag_item: dict, vx: float, vy: float):
 def run_simulated_drag(kv_path: str, x0: float, y0: float, x1: float, y1: float) -> int:
     snap = snapshot_geometry(kv_path)
     drag_item = hit_test_start(snap, x0, y0)
+    if not drag_item and snap.get("surface"):
+        # The guess landed on the other surface's rects: read the other one and retry once.
+        alt = snapshot_geometry(kv_path, avoid=snap["surface"])
+        if alt.get("valid"):
+            snap = alt
+            drag_item = hit_test_start(snap, x0, y0)
     if not drag_item:
         print(json.dumps({"ok": False, "error": "no draggable item at start", "x0": x0, "y0": y0, "snap": snap}))
         return 1
@@ -370,11 +460,17 @@ def is_worker_healthy(data_dir: str) -> bool:
     hb_file = os.path.join(data_dir, "drag_helper.hb")
     try:
         st = os.stat(hb_file)
-        if (time.time() - st.st_mtime) < 4.0:
-            return True
+        if (time.time() - st.st_mtime) >= 4.0:
+            return False
     except Exception:
-        pass
-    return False
+        return False
+    # A worker left over from an older drag_helper.py would keep hit-testing with deleted layout
+    # code; the pid file records when it started, so a newer script means "replace it".
+    pid_file = os.path.join(data_dir, "drag_helper.pid")
+    try:
+        return os.path.getmtime(os.path.abspath(__file__)) <= os.path.getmtime(pid_file)
+    except Exception:
+        return False
 
 
 def spawn_detached_worker(kv_path: str):
@@ -458,6 +554,9 @@ def worker_loop(kv_path: str):
     last_hb = time.monotonic()
     last_kv_mtime = 0.0
     last_periodic_snap = time.monotonic()
+    # The plugin spawns a fresh worker on its own check; an edited script must not keep hit-testing
+    # with the layout code it was started with.
+    script_mtime = os.path.getmtime(os.path.abspath(__file__))
 
     was_down = False
     press_pos = None
@@ -470,6 +569,8 @@ def worker_loop(kv_path: str):
         if now - last_hb >= 1.0:
             last_hb = now
             try:
+                if os.path.getmtime(os.path.abspath(__file__)) != script_mtime:
+                    return
                 with open(pid_file, "r", encoding="utf-8") as f:
                     if f.read().strip() != my_pid:
                         return
@@ -549,8 +650,12 @@ def worker_loop(kv_path: str):
                     refreshed = bool(snap.get("valid"))
                 if cached_snap.get("valid"):
                     drag_item = hit_test_start(cached_snap, vx, vy)
-                if drag_item is None and in_band and not refreshed:
-                    snap = snapshot_geometry(kv_path)
+                # A miss means the cached rects belong to the other surface, or to a layout that
+                # moved since: re-probe whenever the snapshot is older than one press, even when it
+                # was refreshed a moment ago (bounds from the other surface must not veto this).
+                if drag_item is None and (not refreshed or (now - cached_snap.get("ts", 0.0)) > 0.35):
+                    # The cached rects may belong to the other surface: ask for the other one.
+                    snap = snapshot_geometry(kv_path, avoid=cached_snap.get("surface") or "")
                     if snap.get("valid"):
                         cached_snap = snap
                         drag_item = hit_test_start(cached_snap, vx, vy)

@@ -20,7 +20,17 @@ export type ToastLevel = "success" | "info" | "error"
 
 --- Where a file or block opens relative to the focused pane. `"over"` takes the focused (or
 --- target) pane's slot, parking that pane until the new block closes, then puts it back there.
-export type How = "default" | "beside" | "below" | "split" | "tab" | "replace" | "over" | "preview"
+--- `"glimpse"` shows it over the whole tab, in no split, until the next click outside it.
+export type How =
+	"default"
+	| "beside"
+	| "below"
+	| "split"
+	| "tab"
+	| "replace"
+	| "over"
+	| "preview"
+	| "glimpse"
 
 --- What asked Tern to open a file.
 export type Origin = "palette" | "files" | "drop" | "link" | "system" | "cli" | "carly"
@@ -385,6 +395,8 @@ export type UiEvent = {
 	--- action/select/activate/change inside an `el` form: its enabled named controls (radio group: the checked
 	--- value, nil when none; lone checkbox: boolean; same-named checkboxes: array of checked values).
 	values: { [string]: any }?,
+	--- Host only: the window key of the window that sent the event, when a daemon knows it.
+	window: string?,
 	--- Event-specific fields.
 	[string]: any,
 }
@@ -1135,7 +1147,7 @@ export type TabInfo = {
 --- Window only: the window being titled, as a table of its state.
 export type WindowInfo = { [string]: any }
 
---- Window only: a segment of the status line.
+--- Window only: a segment of the plugins' status, shown in the widget bar's "Plugin segments" widget.
 export type StatusSegment = {
 	--- Its text.
 	text: string,
@@ -1145,6 +1157,42 @@ export type StatusSegment = {
 	tone: string?,
 	--- Action name run on click (`"new_tab"`, `"plugin.<id>.<cmd>"`).
 	command: string?,
+}
+
+--- Window only: how a widget draws: its text alone, or a bar, ring or sparkline before it.
+export type WidgetStyle = "text" | "bar" | "ring" | "graph"
+
+--- Window only: a widget a plugin offers the widget bar (`tern.chrome.widget`).
+export type WidgetSpec = {
+	--- Its name in the bar's editor.
+	name: string,
+	--- What it shows, under its name in the editor.
+	description: string?,
+	--- Named icon drawn before it; raises when unknown.
+	icon: string?,
+	--- The styles the user may pick, the first the default; default `{ "text" }`. Raises on an unknown word.
+	styles: { WidgetStyle }?,
+	--- What it shows for the focused pane (nil when no pane is focused); nil shows nothing. A pure formatter:
+	--- 4 ms, cached per input like the other chrome formatters.
+	render: (pane: StatusPaneInfo?) -> WidgetView?,
+}
+
+--- Window only: what a widget's `render` shows. A field of the wrong type fails the render.
+export type WidgetView = {
+	--- Its text (may be empty).
+	text: string,
+	--- Named icon, in place of the declared one.
+	icon: string?,
+	--- Tone (`"accent"`, `"muted"`, `"error"`, …; the widget's `data-tone`).
+	tone: string?,
+	--- Tooltip.
+	title: string?,
+	--- Action name run on click (`"new_tab"`, `"plugin.<id>.<cmd>"`).
+	command: string?,
+	--- How full the `bar` and `ring` styles draw, 0–1 (clamped).
+	value: number?,
+	--- The `graph` style's samples, 0–1 each (clamped), oldest first; the newest 120 are kept.
+	series: { number }?,
 }
 
 --- Window only: the Files pane as a `tern.files.button` handler sees it.
@@ -1307,6 +1355,21 @@ export type PaneExitedEvent = {
 	status: number,
 }
 
+--- `process_exit` payload: a `tern.process.run` child ended after the VM that started it was gone (a reload, or a
+--- daemon upgrade in place), so its callback went with that VM.
+export type ProcessExitEvent = {
+	--- Its process id.
+	pid: number,
+	--- Exit code; -1 when killed (timeout) or ended by a signal.
+	status: number,
+	--- The last 64 KiB of its stdout.
+	stdout: string,
+	--- The last 64 KiB of its stderr.
+	stderr: string,
+	--- True when `timeout_ms` elapsed and the process was killed.
+	timed_out: boolean,
+}
+
 --- Window only: `focus` payload: the focused pane changed.
 export type FocusEvent = {
 	--- Focused pane id.
@@ -1398,8 +1461,10 @@ end
 declare extern type EffectCx with
 	--- Shows a toast; `sub` is a secondary line.
 	function toast(self, level: ToastLevel, text: string, sub: string?): ()
-	--- Opens a file path or URL through the window's `route.link`, then `route.open` with origin `link`.
-	function open(self, target: string): ()
+	--- Opens a file path or URL through the window's `route.link`, then `route.open` with origin `link`. While
+	--- handling a block or lens event (or key), it acts in the window that sent it; `window` names a window key
+	--- whose windows act instead.
+	function open(self, target: string, opts: { window: string? }?): ()
 	--- Copies `text` to the clipboard.
 	function copy(self, text: string): ()
 end
@@ -2117,7 +2182,9 @@ declare tern: {
 	--- Child processes on this context's machine.
 	process: {
 		--- Runs `argv`; without `cb` returns an awaitable, otherwise calls `cb` (window: plus a fresh `cx`); spawn failures raise. Raises on iOS.
-		--- The process starts on the calling thread (the UI thread in the window half) before this returns.
+		--- The process starts on the calling thread (the UI thread in the window half) before this returns. A child
+		--- still running when its VM goes (a reload, a daemon upgrade in place) runs on; its end comes as a
+		--- `process_exit` event in the plugin's new VM instead of `cb`.
 		run: ((argv: { string }, opts: ProcessOptions?, cb: (result: ProcessResult, cx: WindowCx?) -> ()) -> ())
 			& ((argv: { string }, cb: (result: ProcessResult, cx: WindowCx?) -> ()) -> ())
 			& ((argv: { string }, opts: ProcessOptions?) -> Awaitable<ProcessResult>),
@@ -2235,6 +2302,8 @@ declare tern: {
 	},
 
 	--- Subscribes `fn` to lifecycle event `name`; annotate its parameters with the payload types.
+	--- Both: `unload(cx)` before a reload replaces the plugin or it is turned off (stop the processes it supervises),
+	--- and `process_exit(ev: ProcessExitEvent, cx)`.
 	--- Host: `spawn(spec: SpawnSpec) -> SpawnSpec?` (sync filter) and `(ev, cx: EffectCx)` for `command_started`,
 	--- `command_finished`, `cwd`, `title`, `pane_exited`. Window: `window_start(cx: WindowCx)` and `(ev, cx: WindowCx)`
 	--- for `focus`, `pane_created`, `pane_closed`, `tab_created`, `tab_closed`, `command_started`, `command_finished`, `cwd`,
@@ -2270,15 +2339,20 @@ declare tern: {
 		tab_title: (fn: (tab: TabInfo) -> string?) -> (),
 		--- Window only: the window's title; nil keeps the default.
 		window_title: (fn: (win: WindowInfo) -> string?) -> (),
-		--- Window only: status line segments for the focused pane; nil adds none.
+		--- Window only: segments for the focused pane, shown in the widget bar's "Plugin segments" widget; nil
+		--- adds none.
 		status: (fn: (pane: StatusPaneInfo) -> { StatusSegment }?) -> (),
+		--- Window only: offers widget `id` (`^[a-z][a-z0-9-]{0,31}$`) to the widget bar, where the user places it
+		--- (palette › Edit widgets…) as `<plugin>/<id>`. Registering an id again replaces it in place; nil takes it
+		--- away. Raises on a bad id, a missing name or render, an unknown icon or style.
+		widget: (id: string, spec: WidgetSpec?) -> (),
 		--- Window only: the icon tabs, pane rows and parked cards show for `program`: a program key (`codex`, `vim`,
 		--- `shell`; the icons' `data-program`) or a command name (`nvim`, `npm`; `TabInfo.program`). `icon` is a Tern
 		--- icon name (`provider-openai`, `provider:openai`, `sparkle`); nil takes this plugin's choice back. Wins over
 		--- the `program_icons` setting; the first plugin in id order wins a program. Raises on an unknown icon.
 		program_icon: (program: string, icon: string?) -> (),
-		--- Window only: drops this window's cached formatter results and redraws its tabs, status line and title on
-		--- the next frame, so answers that depend on more than their input (a clock, a file, a process result) show.
+		--- Window only: drops this window's cached formatter results and redraws its tabs, widgets and title on the
+		--- next frame, so answers that depend on more than their input (a clock, a file, a process result) show.
 		--- Call it from a timer, event or command, not from a formatter (that raises an error).
 		refresh: () -> (),
 	},
