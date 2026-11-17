@@ -80,6 +80,34 @@ export type ProcessOptions = {
 	timeout_ms: number?,
 }
 
+--- Options of `tern.process.spawn`.
+export type SpawnOptions = {
+	--- Working directory; relative paths resolve against the plugin dir.
+	cwd: string?,
+	--- Variables added to the inherited environment.
+	env: { [string]: string }?,
+	--- How output is cut for `stdout` and `stderr`: "lines" (the default) gives each complete line without its line
+	--- end (`\n` or `\r\n`) and, when the stream ends, what is left unterminated; "chunks" gives the bytes of each
+	--- read. A line past 16 MiB arrives in pieces of that size.
+	split: ("lines" | "chunks")?,
+	--- Called with standard output as it arrives (window: plus a fresh `cx`).
+	stdout: ((data: string, cx: WindowCx?) -> ())?,
+	--- Called with standard error as it arrives (window: plus a fresh `cx`); without it `exit` gets its last 64 KiB.
+	stderr: ((data: string, cx: WindowCx?) -> ())?,
+	--- Called once when the process ended, after the last of its output (window: plus a fresh `cx`).
+	exit: ((result: SpawnExit, cx: WindowCx?) -> ())?,
+}
+
+--- How a `tern.process.spawn` child ended.
+export type SpawnExit = {
+	--- Its process id.
+	pid: number,
+	--- Exit code; -1 when ended by a signal (`child:kill` included).
+	status: number,
+	--- The last 64 KiB of its stderr when no `stderr` callback took it, else empty.
+	stderr: string,
+}
+
 --- Outcome of `tern.process.run`.
 export type ProcessResult = {
 	--- Exit code; -1 when killed (timeout) or ended by a signal.
@@ -102,6 +130,20 @@ export type FetchOptions = {
 	body: string?,
 	--- Fails the request when the whole exchange, redirects included, takes longer (default 30000).
 	timeout_ms: number?,
+	--- Called with the response body as it arrives instead of collecting it (window: plus a fresh `cx`): `chunk` is
+	--- the bytes of one read, `head` the status and headers (the same table every call). The result's `body` is then
+	--- empty and the 16 MiB cap does not apply, while `timeout_ms` still bounds the whole exchange. At most 16 MiB
+	--- wait for the callback; past that reading pauses until it catches up. Return `false` to stop the request: the
+	--- result then has `error = "stopped"`. Raises in Carly's VM.
+	stream: ((chunk: string, head: FetchHead, cx: WindowCx?) -> boolean?)?,
+}
+
+--- What a streamed response said before its body (`FetchOptions.stream`).
+export type FetchHead = {
+	--- HTTP status.
+	status: number,
+	--- Response headers by lowercase name; a repeated header's values joined with `", "`.
+	headers: { [string]: string },
 }
 
 --- Outcome of `tern.fetch`.
@@ -380,7 +422,8 @@ export type Columns = {
 }
 
 --- An event from a node of a block or lens view (`{ev = "action", act = …, …}`). Blocks get only
---- action/select/activate/change/toggle/focus/edit/undo; lens events are not filtered. An action name containing
+--- action/select/activate/change/toggle/focus/edit/undo, and `send` (`id`, `text`: a prompt Tern submits into editor
+--- `id`) once they list the "send" feature; lens events are not filtered. An action name containing
 --- `=` is split into `act` and `value`; `mods` lists `shift`/`ctrl`/`alt`/`meta`, present only when a modifier was
 --- held. `change` comes from a clicked `tern.ui.el` checkbox/radio (`id`, `name`, `value`, `checked`).
 export type UiEvent = {
@@ -443,8 +486,17 @@ export type BlockDef<S> = {
 	--- Handles an event from the view's nodes.
 	event: ((state: S, ev: UiEvent, cx: BlockCx) -> ())?,
 	--- Opts into native editing of the view's editor/input fields: "edit" (a click places the caret, drag/⇧-arrows
-	--- select, edits arrive as `edit` events) and "undo" (⌃Z/⌘Z arrives as an `undo` event, not a key).
-	features: { "edit" | "undo" }?,
+	--- select, edits arrive as `edit` events) and "undo" (⌃Z/⌘Z arrives as an `undo` event, not a key). "send" takes
+	--- the prompts Tern submits for the user, Carly or a plugin (`cx.agents:ask`): each arrives as a `send` event, and
+	--- only for an editor whose `sendable` prop is true.
+	features: { "edit" | "undo" | "send" }?,
+	--- How the surface sits in the pane (the `o` `mode`): "screen" (the default) fills it; "inline" grows down the
+	--- pane like a terminal transcript, `main` scrolling with the pane's scrollback while `dock` stays at its bottom.
+	mode: ("screen" | "inline")?,
+	--- Says the surface is a chat (the `o` `chat`): `main` holds a transcript and `dock` its composer, their nodes
+	--- marked with `chatPart` and `composerPart`. Tern draws it in the user's chat style and treats the pane as an
+	--- agent: it wears the Agent chip, and the Agents widget, `cx.agents` and Carly reach it.
+	chat: boolean?,
 	--- The face of the block's surface (the `o` `font`): "sans" sets people's text (labels, heads, kv, lists, tables)
 	--- in the UI face on 18px lines while machine strings (`mono`/`code`/`num`/`path`/`key` spans) and kinds (code,
 	--- diff, editor, json, …) stay mono; "mono" (the default) keeps the terminal's face throughout.
@@ -515,6 +567,28 @@ export type SpawnSpec = {
 	--- `TERN_WINDOW_KEY`, `TERN_WINDOW_SOCKET`, `TERN_EXE`, `TERN_LENSES`, `TERN_COMPLETE`, `TERN_BLOB_DIR`); the pane's base environment is the
 	--- login environment, not the daemon's (`tern.getenv` here reads the daemon's).
 	env: { [string]: string },
+}
+
+--- Host only: a chat session a pane is about to open again (after a restart, or in a fork), for the `reopen` hook. Tern
+--- runs or types `command`, then the flag (`--resume`, `--restore`, `--fork`) and the session.
+export type ReopenEvent = {
+	--- The pane that ran the chat: the pane a restart starts again, or the pane a fork copies.
+	pane: number,
+	--- Where it opens.
+	cwd: string,
+	--- The pane's shell (`/bin/zsh`), whose command line the result goes into.
+	shell: string,
+	--- `omp`, or `acp` for a `tern acp` chat.
+	agent: "omp" | "acp",
+	--- An omp's session file, or a `tern acp` chat's `<agent>:<session>`.
+	session: string,
+	--- `resume` or `restore` after a restart, `fork` in a fork.
+	how: "resume" | "restore" | "fork",
+	--- What runs before the flag: `omp` typed at a shell's prompt, an agent pane's own command, or `tern acp`; an
+	--- earlier plugin's result.
+	command: string,
+	--- The command line the pane's shell was running (`sandbox -k omp`), when known.
+	line: string?,
 }
 
 --- Native pane kinds; agent and plugin blocks are programs with terminal surfaces.
@@ -1159,10 +1233,10 @@ export type StatusSegment = {
 	command: string?,
 }
 
---- Window only: how a widget draws: its text alone, or a bar, ring or sparkline before it.
+--- How a widget draws: its text alone, or a bar, ring or sparkline before it.
 export type WidgetStyle = "text" | "bar" | "ring" | "graph"
 
---- Window only: a widget a plugin offers the widget bar (`tern.chrome.widget`).
+--- A widget a plugin offers the widget bar (`tern.chrome.widget`), from either half.
 export type WidgetSpec = {
 	--- Its name in the bar's editor.
 	name: string,
@@ -1172,12 +1246,13 @@ export type WidgetSpec = {
 	icon: string?,
 	--- The styles the user may pick, the first the default; default `{ "text" }`. Raises on an unknown word.
 	styles: { WidgetStyle }?,
-	--- What it shows for the focused pane (nil when no pane is focused); nil shows nothing. A pure formatter:
-	--- 4 ms, cached per input like the other chrome formatters.
+	--- What it shows; nil shows nothing. A pure formatter: 4 ms. In a window half it gets the focused pane (nil
+	--- when no pane is focused) and is cached per input like the other chrome formatters; in the host half it
+	--- gets nil and runs when the widget is registered and at each `tern.chrome.refresh`.
 	render: (pane: StatusPaneInfo?) -> WidgetView?,
 }
 
---- Window only: what a widget's `render` shows. A field of the wrong type fails the render.
+--- What a widget's `render` shows. A field of the wrong type fails the render.
 export type WidgetView = {
 	--- Its text (may be empty).
 	text: string,
@@ -1355,8 +1430,8 @@ export type PaneExitedEvent = {
 	status: number,
 }
 
---- `process_exit` payload: a `tern.process.run` child ended after the VM that started it was gone (a reload, or a
---- daemon upgrade in place), so its callback went with that VM.
+--- `process_exit` payload: a `tern.process.run` or `tern.process.spawn` child ended after the VM that started it was
+--- gone (a reload, or a daemon upgrade in place), so its callbacks went with that VM.
 export type ProcessExitEvent = {
 	--- Its process id.
 	pid: number,
@@ -1469,6 +1544,19 @@ declare extern type EffectCx with
 	function copy(self, text: string): ()
 end
 
+--- What a block says it is doing (`cx:status`), as a program does with OSC 7501.
+export type BlockState = "idle" | "working" | "blocked" | "done" | "error"
+
+--- Details of `cx:status`.
+export type BlockStatus = {
+	--- A line saying what or why (at most 2048 bytes).
+	msg: string?,
+	--- What a `blocked` block waits on.
+	kind: ("permission" | "question" | "auth")?,
+	--- How far a `working` or `blocked` block got, 0–100; without it progress is indeterminate.
+	progress: number?,
+}
+
 --- Host only: the `cx` of a plugin block.
 declare extern type BlockCx extends EffectCx with
 	--- Pane id.
@@ -1489,6 +1577,23 @@ declare extern type BlockCx extends EffectCx with
 	function frame(self, ops: { any }): ()
 	--- Stores `bytes` of type `mime` (`"image/png"`); returns the blob id for an `image` node's `blob` prop.
 	function blob(self, bytes: string, mime: string): string
+	--- Says what the block is doing, as a program does with OSC 7501: its tab, the inbox and the Agents widget show
+	--- it, and a `working` or `blocked` block asks before its pane closes. nil clears it. Bad states, kinds and a
+	--- `msg` over its limit raise.
+	function status(self, state: BlockState?, opts: BlockStatus?): ()
+end
+
+--- A running child of `tern.process.spawn`.
+declare extern type Child with
+	--- Its process id.
+	pid: number
+	--- Queues `data` for the child's stdin; raises once stdin was closed or the child ended.
+	function write(self, data: string): ()
+	--- Closes the child's stdin after what `write` queued: the child reads the end of its input.
+	function close_stdin(self): ()
+	--- Ends the child: "terminate" (the default) asks it to (SIGTERM), "interrupt" is ⌃C (SIGINT) and "kill" cannot
+	--- be refused (SIGKILL). On Windows each ends the process at once. No effect once it ended.
+	function kill(self, signal: ("terminate" | "interrupt" | "kill")?): ()
 end
 
 --- A persistent window-authored canvas; view and md are mutually exclusive.
@@ -2126,6 +2231,9 @@ declare tern: {
 		decode: (text: string) -> string,
 	},
 
+	--- SHA-256 of `data`'s bytes as 64 lowercase hex digits.
+	sha256: (data: string) -> string,
+
 	--- Monotonic milliseconds (fractional).
 	now: () -> number,
 
@@ -2188,6 +2296,13 @@ declare tern: {
 		run: ((argv: { string }, opts: ProcessOptions?, cb: (result: ProcessResult, cx: WindowCx?) -> ()) -> ())
 			& ((argv: { string }, cb: (result: ProcessResult, cx: WindowCx?) -> ()) -> ())
 			& ((argv: { string }, opts: ProcessOptions?) -> Awaitable<ProcessResult>),
+		--- Starts `argv` and returns its handle at once; its output streams to `opts.stdout` and `opts.stderr` and its
+		--- end to `opts.exit`, each on the VM's thread. Spawn failures raise. Raises on iOS and in Carly's VM.
+		--- At most 16 MiB of output wait for the callbacks; past that the child's writes block until they catch up.
+		--- A child still running when its VM goes (a reload, a daemon upgrade in place) has its stdin closed and runs
+		--- on; its end comes as a `process_exit` event in the plugin's new VM. Stop the children you supervise in
+		--- `unload`.
+		spawn: (argv: { string }, opts: SpawnOptions?) -> Child,
 	},
 
 	--- Sends an HTTP(S) request; without `cb` returns an awaitable, otherwise calls `cb` with the whole response
@@ -2304,13 +2419,15 @@ declare tern: {
 	--- Subscribes `fn` to lifecycle event `name`; annotate its parameters with the payload types.
 	--- Both: `unload(cx)` before a reload replaces the plugin or it is turned off (stop the processes it supervises),
 	--- and `process_exit(ev: ProcessExitEvent, cx)`.
-	--- Host: `spawn(spec: SpawnSpec) -> SpawnSpec?` (sync filter) and `(ev, cx: EffectCx)` for `command_started`,
+	--- Host: `spawn(spec: SpawnSpec) -> SpawnSpec?` and `reopen(ev: ReopenEvent) -> string?` (sync filters; a string
+	--- replaces `ev.command`) and `(ev, cx: EffectCx)` for `command_started`,
 	--- `command_finished`, `cwd`, `title`, `pane_exited`. Window: `window_start(cx: WindowCx)` and `(ev, cx: WindowCx)`
 	--- for `focus`, `pane_created`, `pane_closed`, `tab_created`, `tab_closed`, `command_started`, `command_finished`, `cwd`,
 	--- `title`, `agent_finished`, `agent_state` (AgentStateEvent), `float_moved` (FloatMovedEvent), `session_ended`
 	--- (SessionEndedEvent), `budget` (BudgetEvent) and `canvas_action(ev: CanvasAction, cx) -> boolean?` (truthy
 	--- consumes the owner's click).
-	--- `window_start` runs once per plugin per window. The `spawn` wait (50 ms) counts from when the request is queued.
+	--- `window_start` runs once per plugin per window. The `spawn` and `reopen` waits (50 ms) count from when the
+	--- request is queued.
 	on: (name: string, fn: (...any) -> ...any) -> (),
 
 	--- Window only: adds a palette command, also bindable as action `plugin.<plugin>.<id>`.
@@ -2332,8 +2449,9 @@ declare tern: {
 		link: (fn: (link: LinkRequest, cx: WindowCx) -> RouteDecision?) -> (),
 	},
 
-	--- Window only: pure formatters for window chrome, cached per input (cleared on reload, a registration or
-	--- `refresh`). The chrome redraws on session changes and pane output; `refresh` redraws it for anything else.
+	--- Pure formatters for window chrome. In the window half they are cached per input (cleared on reload, a
+	--- registration or `refresh`), and the chrome redraws on session changes and pane output; `refresh` redraws it
+	--- for anything else. The host half has `widget` and `refresh` alone: its widgets render on the host.
 	chrome: {
 		--- Window only: a tab's title; nil keeps the default.
 		tab_title: (fn: (tab: TabInfo) -> string?) -> (),
@@ -2342,18 +2460,24 @@ declare tern: {
 		--- Window only: segments for the focused pane, shown in the widget bar's "Plugin segments" widget; nil
 		--- adds none.
 		status: (fn: (pane: StatusPaneInfo) -> { StatusSegment }?) -> (),
-		--- Window only: offers widget `id` (`^[a-z][a-z0-9-]{0,31}$`) to the widget bar, where the user places it
-		--- (palette › Edit widgets…) as `<plugin>/<id>`. Registering an id again replaces it in place; nil takes it
-		--- away. Raises on a bad id, a missing name or render, an unknown icon or style.
+		--- Offers widget `id` (`^[a-z][a-z0-9-]{0,31}$`) to the widget bar, where the user places it (palette › Edit
+		--- widgets…) as `<plugin>/<id>`. Registering an id again replaces it in place; nil takes it away. Raises on a
+		--- bad id, a missing name or render, an unknown icon or style. In the host half, `render` runs on the host
+		--- (the session daemon) with no pane, when the widget is registered and at each `tern.chrome.refresh`; what
+		--- it returns reaches every window attached to that host, on this machine or another, so a widget can show
+		--- state only the host has. A window half's widget of the same id wins in its window; with several hosts
+		--- offering it, the focused pane's host's shows.
 		widget: (id: string, spec: WidgetSpec?) -> (),
 		--- Window only: the icon tabs, pane rows and parked cards show for `program`: a program key (`codex`, `vim`,
 		--- `shell`; the icons' `data-program`) or a command name (`nvim`, `npm`; `TabInfo.program`). `icon` is a Tern
 		--- icon name (`provider-openai`, `provider:openai`, `sparkle`); nil takes this plugin's choice back. Wins over
 		--- the `program_icons` setting; the first plugin in id order wins a program. Raises on an unknown icon.
 		program_icon: (program: string, icon: string?) -> (),
-		--- Window only: drops this window's cached formatter results and redraws its tabs, widgets and title on the
-		--- next frame, so answers that depend on more than their input (a clock, a file, a process result) show.
-		--- Call it from a timer, event or command, not from a formatter (that raises an error).
+		--- In a window half, drops this window's cached formatter results and redraws its tabs, widgets and title on
+		--- the next frame, so answers that depend on more than their input (a clock, a file, a process result) show.
+		--- In the host half, renders this plugin's host widgets again once the current call returns and sends every
+		--- attached window those that changed. Call it from a timer, event, process or fetch callback or command,
+		--- not from a formatter or `render` (that raises an error).
 		refresh: () -> (),
 	},
 
